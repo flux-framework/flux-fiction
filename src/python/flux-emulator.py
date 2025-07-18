@@ -312,7 +312,7 @@ class Simulation(object):
         
         if self.pending_continuation:
             self.pending_continuation = False
-            self.flux_handle.rpc("job-manager.sandbox.quiescent", {"time": self.current_time}).then(
+            self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
                 lambda fut, arg: arg.quiescent_cb(), arg=self
             )
 
@@ -347,7 +347,7 @@ class Simulation(object):
             if self.is_quiescent():
                 self.pending_continuation = False
                 print("advancing from state transition")
-                self.flux_handle.rpc("job-manager.sandbox.quiescent", {"time": self.current_time}).then(
+                self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
                 lambda fut, arg: arg.quiescent_cb(), arg=self
                 )
 
