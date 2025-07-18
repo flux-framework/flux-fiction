@@ -1,7 +1,7 @@
 #include <flux/core.h>
 #include <flux/jobtap.h>
 
-#define PLUGIN_NAME    "emu=jobtap"
+#define PLUGIN_NAME    "emu-jobtap"
 
 // Struct to hold emulator context
 struct emulator {
