@@ -57,9 +57,10 @@ class Job(object):
     '''
     Class to track individual jobs within the emulator
     '''
-    def __init__(self, nnodes, ncpus, submit_time, elapsed_time, timelimit, exitcode=0):
+    def __init__(self, nnodes, ncpus, submit_time, elapsed_time, timelimit, exitcode=0, ngpus=0):
         self.nnodes = nnodes
         self.ncpus = ncpus
+        self.ngpus = int(ngpus or 0)
         self.submit_time = submit_time
         self.elapsed_time = elapsed_time
         self.timelimit = timelimit
@@ -77,8 +78,20 @@ class Job(object):
             return self._jobspec
 
         assert self.ncpus % self.nnodes == 0
+        withs = []
         core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
-        slot = create_slot("task", 1, [core])
+        withs.append(core)
+        if self.ngpus:
+            # Request GPUs per node similar to cores (rounded up if uneven)
+            if self.ngpus % self.nnodes != 0:
+                logger.warning(
+                    "NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
+                    .format(self.ngpus, self.nnodes)
+                )
+            gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
+            withs.append(gpu)
+
+        slot = create_slot("task", 1, withs)
         if self.nnodes > 0:
             resource_section = create_resource("node", self.nnodes, [slot])
         else:
@@ -418,10 +431,10 @@ class Simulation(object):
             logger.info("Scheduling next advance after 100ms delay")
             self.timer = TimerWatcher(
                 self.flux_handle,
-                0.6,       
-                self.advance  
+                0.6,
+                self.advance
             )
-            self.timer.start() 
+            self.timer.start()
         else:
             logger.info("Ending from quiescent")
 
@@ -505,7 +518,7 @@ def walltime_str_to_timedelta(walltime_str):
 @six.add_metaclass(ABCMeta)
 class JobTraceReader(object):
     '''
-    Class that is used to ingest job traces 
+    Class that is used to ingest job traces
     '''
     def __init__(self, tracefile):
         self.tracefile = tracefile
@@ -524,8 +537,12 @@ def job_from_slurm_row(row):
     generates a Job class from a sacct style job trace
     '''
     kwargs = {}
-    if "ExitCode" in row:
-        kwargs["exitcode"] = "ExitCode"
+    if "ExitCode" in row and row["ExitCode"]:
+        # sacct ExitCode is often "0:0"; take primary code
+        try:
+            kwargs["exitcode"] = int(str(row["ExitCode"]).split(":")[0])
+        except Exception:
+            kwargs["exitcode"] = 0
 
     submit_time = datetime_to_epoch(
         datetime.strptime(row["Submit"], "%Y-%m-%dT%H:%M:%S")
@@ -557,14 +574,23 @@ def job_from_slurm_row(row):
             )
         )
 
-    return Job(nnodes, ncpus, submit_time, elapsed, timelimit, **kwargs)
+    ngpus = 0
+    if "NGPUS" in row and row["NGPUS"] not in (None, "", "0"):
+        try:
+            ngpus = int(row["NGPUS"])
+        except Exception:
+            logger.warning("Invalid NGPUS value '{}'; treating as 0".format(row["NGPUS"]))
+            ngpus = 0
+
+    return Job(nnodes, ncpus, submit_time, elapsed, timelimit, ngpus=ngpus, **kwargs)
 
 
 class SacctReader(JobTraceReader):
-    required_fields = ["Elapsed", "Timelimit", "Submit", "NNodes", "NCPUS"]
+    required_fields_base = ["Elapsed", "Timelimit", "Submit", "NNodes", "NCPUS"]
 
-    def __init__(self, tracefile):
+    def __init__(self, tracefile, require_gpus=False):
         super(SacctReader, self).__init__(tracefile)
+        self.require_gpus = require_gpus
         self.determine_delimiter()
 
     def determine_delimiter(self):
@@ -582,14 +608,17 @@ class SacctReader(JobTraceReader):
         with open(self.tracefile) as infile:
             reader = csv.reader(infile, delimiter=self.delim)
             header_fields = set(next(reader))
-        for req_field in SacctReader.required_fields:
+        required_fields = list(SacctReader.required_fields_base)
+        if self.require_gpus:
+            required_fields.append("NGPUS")
+        for req_field in required_fields:
             if req_field not in header_fields:
                 raise ValueError("Job file is missing '{}'".format(req_field))
 
     def read_trace(self):
         """
         You can obtain the necessary information from the sacct command using the -o flag.
-        For example: sacct -o nnodes,ncpus,timelimit,state,submit,elapsed,exitcode
+        For example: sacct -o nnodes,ncpus,timelimit,state,submit,elapsed,exitcode[,ngpus]
         """
         with open(self.tracefile) as infile:
             lines = [line for line in infile.readlines()
@@ -599,39 +628,54 @@ class SacctReader(JobTraceReader):
         return jobs
 
 
-def insert_resource_data(flux_handle, num_ranks, cores_per_rank, hostname_pattern="node{rank}"):
-    '''
-    Generates a resource set from the user input and inserts it into KVS
-
-    This will replace the default system resource set that is generated by the resource module
-
-    Because of this, we have to restart the resource module and scheduler so they take in our
-    resource set.
-    '''
+def insert_resource_data(flux_handle, num_ranks, cores_per_rank,
+                         hostname_pattern="node{rank}", gpus_per_rank=0):
+    """
+    Build R using Rlist.add_rank(...) for cores, then add GPU children per rank
+    with rlist.add_child(rank, "gpu", "<idset>"). Debug-print the final JSON
+    before committing to KVS.
+    """
     if num_ranks <= 0 or cores_per_rank <= 0:
-        raise ValueError(
-            "Number of ranks and cores per rank must be positive integers")
+        raise ValueError("Number of ranks and cores per rank must be positive integers")
 
     rlist = Rlist()
 
     for rank in range(num_ranks):
-        core_range = f'0-{cores_per_rank - 1}' if cores_per_rank > 1 else '0'
+        core_range = f"0-{cores_per_rank - 1}" if cores_per_rank > 1 else "0"
         hostname = hostname_pattern.format(rank=rank)
+
+        # Add the node with its core children
         rlist.add_rank(rank, hostname=hostname, cores=core_range)
 
-    rlist_str = rlist.encode()
-    rlist_json = json.loads(rlist_str)
+        # If GPUs enabled, append a gpu child ID set to this rank
+        if gpus_per_rank and gpus_per_rank > 0:
+            gpu_range = f"0-{gpus_per_rank - 1}" if gpus_per_rank > 1 else "0"
+            # This attaches {"gpu": "0-(gpus_per_rank-1)"} at this rank
+            rlist.add_child(rank, "gpu", gpu_range)
 
+    # Encode to the canonical R JSON string and pretty-print for debug
+    rlist_str = rlist.encode()
+    try:
+        rlist_json = json.loads(rlist_str)
+    except Exception:
+        # Fallback if encode() isn't pure JSON (should be)
+        rlist_json = {"RAW_R": rlist_str}
+
+    logger.debug("resource.R going to KVS:\n%s",
+                 json.dumps(rlist_json, indent=2, sort_keys=True))
+
+    # Put into KVS and commit
     kvs_key = "resource.R"
     put_rc = flux.kvs.put(flux_handle, kvs_key, rlist_json)
     if put_rc is not None:
-        raise ValueError(
-            f"Error inserting resource data into KVS, rc={put_rc}")
+        raise ValueError(f"Error inserting resource data into KVS, rc={put_rc}")
 
     commit_rc = flux.kvs.commit(flux_handle)
     if commit_rc is not None:
-        raise ValueError(
-            f"Error committing resource data to KVS, rc={commit_rc}")
+        raise ValueError(f"Error committing resource data to KVS, rc={commit_rc}")
+    
+    print("Rlist ENCODE():", rlist.encode())
+
 
 
 def get_loaded_modules(flux_handle):
@@ -668,6 +712,8 @@ def reload_modules(flux_handle, scheduler, queue_policy = "fcfs"):
     sched_module = "sched-simple"
     path = None
     resource_module_path = None
+    fluxion_qmanager_path = None
+    fluxion_resource_path = None
     # Acquire the path to the scheduling module being used
     # Additionally, acquire the path to the resource module
     for module in get_loaded_modules(flux_handle):
@@ -839,11 +885,13 @@ class SimpleExec(object):
     '''
     Simple exec module that is used to simulate the execution of jobs in the eyes of Flux
     '''
-    def __init__(self, num_nodes, cores_per_node):
+    def __init__(self, num_nodes, cores_per_node, gpus_per_node=0):
         self.num_nodes = num_nodes
         self.cores_per_node = cores_per_node
+        self.gpus_per_node = int(gpus_per_node or 0)
         self.num_free_nodes = num_nodes
         self.used_core_hours = 0
+        self.used_gpu_hours = 0
 
         self.makespan = Makespan(
             beginning=float('inf'),
@@ -876,6 +924,11 @@ class SimpleExec(object):
             logger.error("Scheduler over-subscribed nodes")
         if (job.ncpus / job.nnodes) > self.cores_per_node:
             logger.error("Scheduler over-subscribed cores on the node")
+        if job.ngpus:
+            if not self.gpus_per_node:
+                logger.error("Job requested GPUs but system has none configured")
+            elif (job.ngpus / job.nnodes) > self.gpus_per_node:
+                logger.error("Scheduler over-subscribed GPUs on the node")
 
     def complete_job(self, simulation, job):
         '''
@@ -883,31 +936,47 @@ class SimpleExec(object):
         '''
         self.num_free_nodes += job.nnodes
         self.used_core_hours += (job.ncpus * job.elapsed_time) / 3600
+        if job.ngpus:
+            self.used_gpu_hours += (job.ngpus * job.elapsed_time) / 3600
         self.update_makespan(simulation.current_time)
 
     def post_analysis(self, simulation):
-        '''
-        Outputs statistics about the simulation whenever called
-        '''
+        """
+        Outputs statistics about the simulation whenever called.
+        """
         if self.makespan.beginning > self.makespan.end:
-            logger.warning("Makespan beginning ({}) greater than end ({})".format(
-                self.makespan.beginning,
-                self.makespan.end,
-            ))
+            logger.warning(
+                "Makespan beginning ({}) greater than end ({})".format(
+                    self.makespan.beginning, self.makespan.end
+                )
+            )
 
-        total_num_cores = self.num_nodes * self.cores_per_node
-        print("Makespan (hours): {:.1f}".format(
-            (self.makespan.end - self.makespan.beginning) / 3600))
-        total_core_hours = (
-            total_num_cores * (self.makespan.end - self.makespan.beginning)) / 3600
+        makespan_hours = max(0.0, (self.makespan.end - self.makespan.beginning) / 3600.0)
+
+        # Core stats
+        total_core_hours = self.num_nodes * self.cores_per_node * makespan_hours
+        print("Makespan (hours): {:.1f}".format(makespan_hours))
         print("Total Core-Hours: {:,.1f}".format(total_core_hours))
         print("Used Core-Hours: {:,.1f}".format(self.used_core_hours))
-        try:
+        if total_core_hours > 0:
             print("Average Core-Utilization: {:.2f}%".format(
-                (self.used_core_hours / total_core_hours) * 100))
-        except:
-            print(
-                "ERROR: Total core hours is 0. Simulation likely didn't run or no jobs were submitted. ")
+                (self.used_core_hours / total_core_hours) * 100.0
+            ))
+        else:
+            print("ERROR: Total core hours is 0. Simulation likely didn't run or no jobs were submitted.")
+
+        # GPU stats (only if GPUs are configured)
+        if self.gpus_per_node:
+            total_gpu_hours = self.num_nodes * self.gpus_per_node * makespan_hours
+            print("Total GPU-Hours: {:,.1f}".format(total_gpu_hours))
+            print("Used GPU-Hours:  {:,.1f}".format(self.used_gpu_hours))
+            if total_gpu_hours > 0:
+                print("Average GPU-Utilization: {:.2f}%".format(
+                    (self.used_gpu_hours / total_gpu_hours) * 100.0
+                ))
+            else:
+                print("ERROR: Total GPU hours is 0. (GPUs configured but zero makespan?)")
+
 
 
 logger = logging.getLogger("flux-emulator")
@@ -936,6 +1005,11 @@ def main():
     parser.add_argument("job_file")
     parser.add_argument("num_ranks", type=int)
     parser.add_argument("cores_per_rank", type=int)
+    # Optional GPUs per rank/node: positional or flag
+    parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0,
+                        help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
+    parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int,
+                        help="Override GPUs per rank/node (same as optional 3rd positional)")
     parser.add_argument("--log-level", type=int)
     args = parser.parse_args()
 
@@ -944,7 +1018,7 @@ def main():
 
     flux_handle = flux.Flux()
 
-    exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank)
+    exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank)
     simulation = Simulation(
         flux_handle,
         EventList(),
@@ -953,9 +1027,9 @@ def main():
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
     )
-    reader = SacctReader(args.job_file)
+    reader = SacctReader(args.job_file, require_gpus=(args.gpus_per_rank and args.gpus_per_rank > 0))
     reader.validate_trace()
-    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank)
+    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
     jobs = list(reader.read_trace())
     for job in jobs:
         job.insert_apriori_events(simulation)
