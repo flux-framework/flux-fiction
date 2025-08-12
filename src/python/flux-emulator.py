@@ -59,6 +59,9 @@ class Job(object):
     '''
     def __init__(self, nnodes, ncpus, submit_time, elapsed_time, timelimit, exitcode=0, ngpus=0):
         self.nnodes = nnodes
+        self.exclusive = False
+        self.cores_per_node = None
+        self.gpus_per_node = None
         self.ncpus = ncpus
         self.ngpus = int(ngpus or 0)
         self.submit_time = submit_time
@@ -77,41 +80,47 @@ class Job(object):
         if self._jobspec is not None:
             return self._jobspec
 
-        assert self.ncpus % self.nnodes == 0
         withs = []
-        core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
-        withs.append(core)
-        if self.ngpus:
-            # Request GPUs per node similar to cores (rounded up if uneven)
-            if self.ngpus % self.nnodes != 0:
-                logger.warning(
-                    "NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
-                    .format(self.ngpus, self.nnodes)
-                )
-            gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
-            withs.append(gpu)
+        if self.exclusive:
+            # request full node capacity
+            core = create_resource("core", int(self.cores_per_node))
+            withs.append(core)
+            if self.gpus_per_node:
+                gpu = create_resource("gpu", int(self.gpus_per_node))
+                withs.append(gpu)
+        else:
+            assert self.ncpus % self.nnodes == 0
+            core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
+            withs.append(core)
+            if self.ngpus:
+                if self.ngpus % self.nnodes != 0:
+                    logger.warning("NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
+                                .format(self.ngpus, self.nnodes))
+                gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
+                withs.append(gpu)
 
         slot = create_slot("task", 1, withs)
-        if self.nnodes > 0:
-            resource_section = create_resource("node", self.nnodes, [slot])
-        else:
-            resource_section = slot
-
+        resource_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
         jobspec = {
             "version": 1,
             "resources": [resource_section],
-            "tasks": [
-                {
-                    "command": ["sleep", "0"],
-                    "slot": "task",
-                    "count": {"per_slot": 1},
-                }
-            ],
+            "tasks": [{
+                "command": ["sleep", "0"],
+                "slot": "task",
+                "count": {"per_slot": 1},
+            }],
             "attributes": {"system": {"duration": self.timelimit}},
         }
-
         self._jobspec = jobspec
         return self._jobspec
+
+
+    def set_exclusive(self, cores_per_node, gpus_per_node=0):
+        self.exclusive = True
+        self.cores_per_node = int(cores_per_node)
+        self.gpus_per_node = int(gpus_per_node or 0)
+        self._jobspec = None  # force rebuild with exclusive spec
+
 
     def submit(self, flux_handle):
         '''
@@ -885,10 +894,11 @@ class SimpleExec(object):
     '''
     Simple exec module that is used to simulate the execution of jobs in the eyes of Flux
     '''
-    def __init__(self, num_nodes, cores_per_node, gpus_per_node=0):
+    def __init__(self, num_nodes, cores_per_node, gpus_per_node=0, exclusive=False):
         self.num_nodes = num_nodes
         self.cores_per_node = cores_per_node
         self.gpus_per_node = int(gpus_per_node or 0)
+        self.exclusive = bool(exclusive)
         self.num_free_nodes = num_nodes
         self.used_core_hours = 0
         self.used_gpu_hours = 0
@@ -922,22 +932,29 @@ class SimpleExec(object):
         self.num_free_nodes -= job.nnodes
         if self.num_free_nodes < 0:
             logger.error("Scheduler over-subscribed nodes")
-        if (job.ncpus / job.nnodes) > self.cores_per_node:
-            logger.error("Scheduler over-subscribed cores on the node")
-        if job.ngpus:
-            if not self.gpus_per_node:
-                logger.error("Job requested GPUs but system has none configured")
-            elif (job.ngpus / job.nnodes) > self.gpus_per_node:
-                logger.error("Scheduler over-subscribed GPUs on the node")
+
+        if not self.exclusive:
+            if (job.ncpus / job.nnodes) > self.cores_per_node:
+                logger.error("Scheduler over-subscribed cores on the node")
+            if job.ngpus:
+                if not self.gpus_per_node:
+                    logger.error("Job requested GPUs but system has none configured")
+                elif (job.ngpus / job.nnodes) > self.gpus_per_node:
+                    logger.error("Scheduler over-subscribed GPUs on the node")
 
     def complete_job(self, simulation, job):
         '''
         Updates the makespan for jobs that complete
         '''
         self.num_free_nodes += job.nnodes
-        self.used_core_hours += (job.ncpus * job.elapsed_time) / 3600
-        if job.ngpus:
-            self.used_gpu_hours += (job.ngpus * job.elapsed_time) / 3600
+        if self.exclusive:
+            self.used_core_hours += (self.cores_per_node * job.nnodes * job.elapsed_time) / 3600
+            if self.gpus_per_node:
+                self.used_gpu_hours += (self.gpus_per_node * job.nnodes * job.elapsed_time) / 3600
+        else:
+            self.used_core_hours += (job.ncpus * job.elapsed_time) / 3600
+            if job.ngpus:
+                self.used_gpu_hours += (job.ngpus * job.elapsed_time) / 3600
         self.update_makespan(simulation.current_time)
 
     def post_analysis(self, simulation):
@@ -1005,12 +1022,13 @@ def main():
     parser.add_argument("job_file")
     parser.add_argument("num_ranks", type=int)
     parser.add_argument("cores_per_rank", type=int)
-    # Optional GPUs per rank/node: positional or flag
     parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0,
                         help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
     parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int,
                         help="Override GPUs per rank/node (same as optional 3rd positional)")
     parser.add_argument("--log-level", type=int)
+    parser.add_argument("--exclusive", action="store_true",
+                    help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
     args = parser.parse_args()
 
     if args.log_level:
@@ -1018,7 +1036,7 @@ def main():
 
     flux_handle = flux.Flux()
 
-    exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank)
+    exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank, exclusive=args.exclusive)
     simulation = Simulation(
         flux_handle,
         EventList(),
@@ -1031,6 +1049,9 @@ def main():
     reader.validate_trace()
     insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
     jobs = list(reader.read_trace())
+    if args.exclusive:
+        for job in jobs:
+            job.set_exclusive(args.cores_per_rank, args.gpus_per_rank)
     for job in jobs:
         job.insert_apriori_events(simulation)
     scheduler = 1
