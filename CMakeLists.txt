@@ -5,6 +5,8 @@ project(emu-jobtap LANGUAGES C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JANSSON REQUIRED IMPORTED_TARGET jansson)
 
 # Options for system vs local Flux Core
 option(USE_SYSTEM_FLUX "Link against a system-installed flux-core" ON)
@@ -64,7 +66,11 @@ set(JOBTAP_SRC_DIR "${CMAKE_SOURCE_DIR}/src/jobtap")
 add_library(emu_jobtap SHARED
     ${JOBTAP_SRC_DIR}/emu-jobtap.c)
 target_compile_options(emu_jobtap PRIVATE -Wall -Wextra)
-target_link_libraries(emu_jobtap PRIVATE flux-core)
+target_link_libraries(emu_jobtap
+  PRIVATE
+    flux-core
+    PkgConfig::JANSSON
+)
 
 
 # Embed RPATH for local clone builds only

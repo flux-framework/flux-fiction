@@ -11,7 +11,7 @@ import heapq
 from abc import ABCMeta, abstractmethod
 from datetime import datetime, timedelta
 from collections.abc import Sequence
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 import math
 import six
 import flux
@@ -119,7 +119,7 @@ class Job(object):
         self.exclusive = True
         self.cores_per_node = int(cores_per_node)
         self.gpus_per_node = int(gpus_per_node or 0)
-        self._jobspec = None  # force rebuild with exclusive spec
+        self._jobspec = None  
 
 
     def submit(self, flux_handle):
@@ -192,6 +192,7 @@ class Job(object):
         '''
         # TODO: add priority to `add_event` so that all submits for a given time
         # can happen consecutively, followed by the waits for the jobids
+        simulation.step_expect[self.submit_time]["submits"] += 1
         simulation.add_event(
             self.submit_time, lambda: simulation.submit_job(self))
 
@@ -259,7 +260,7 @@ class EventList(six.Iterator):
         try:
             time, event_list = heapq.heappop(self.time_heap)
             self.time_map.pop(time)
-            self._current_time = time  # used for warning messages in `add_event`
+            self._current_time = time  
             return time, event_list
         except (IndexError, KeyError):
             raise StopIteration()
@@ -292,6 +293,7 @@ class Simulation(object):
         self.start_job_hook = start_job_hook
         self.complete_job_hook = complete_job_hook
         self.pending_continuation = False
+        self.step_expect = defaultdict(lambda: {"submits": 0, "finishes": 0})
 
     def add_event(self, time, callback):
         '''
@@ -315,28 +317,20 @@ class Simulation(object):
         logger.info("Submitted job {}".format(job.jobid))
 
     def start_job(self, jobid, start_msg):
-        '''
-        Invoked whenever a request to start a job is made by the job manager
-
-        Will record the event within the job's state transition dict
-
-        If the internal loop of the emulator is paused, it will resume it after double checking that the scheduler is inactive 
-        '''
         job = self.job_map[jobid]
         job.record_state_transition("STARTED", self.current_time)
         if self.start_job_hook:
             self.start_job_hook(self, job)
         job.start(self.flux_handle, start_msg, self.current_time)
-        logger.info("Started job {}".format(job.jobid))
-        self.add_event(job.complete_time, lambda: self.complete_job(job))
-        logger.info("Registered job {} to complete at {}".format(
-            job.jobid, job.complete_time))
-        
-        if self.pending_continuation:
-            self.pending_continuation = False
-            self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
-                lambda fut, arg: arg.quiescent_cb(), arg=self
-            )
+
+        # schedule completion
+        ct = job.complete_time
+        self.add_event(ct, lambda: self.complete_job(job))
+
+        # record expectations for that completion step
+        self.step_expect[ct]["finishes"] += 1
+
+
 
 
     def complete_job(self, job):
@@ -349,7 +343,7 @@ class Simulation(object):
             self.complete_job_hook(self, job)
         job.complete(self.flux_handle)
         logger.info("Completed job {}".format(job.jobid))
-        self.pending_inactivations.add(job)
+        # self.pending_inactivations.add(job)
 
 
     def record_job_state_transition(self, jobid, state):
@@ -364,14 +358,14 @@ class Simulation(object):
         if state == 'INACTIVE' and job in self.pending_inactivations:
             # Have to add this event or the emulator will try to exit before actually running the next job if there is one
             # Needs to be revisited
-            self.add_event(self.current_time + 1e-9, lambda: None)
+            # self.add_event(self.current_time + 1e-9, lambda: None)
             self.pending_inactivations.remove(job)
-            if self.is_quiescent():
-                self.pending_continuation = False
-                print("advancing from state transition")
-                self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
-                lambda fut, arg: arg.quiescent_cb(), arg=self
-                )
+            # if self.is_quiescent():
+            #     self.pending_continuation = False
+            #     print("advancing from state transition")
+            #     self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
+            #     lambda fut, arg: arg.quiescent_cb(), arg=self
+            #     )
 
     def advance(self, *args, **kwargs):
         '''
@@ -399,32 +393,49 @@ class Simulation(object):
             self.current_time, events_at_time = next(self.event_list)
         except StopIteration:
             if self.num_complete < self.num_submits:
-                self.pending_continuation = True
-                pass
+                # Jobs in flight; ask the plugin to tell us when the system is stable.
+                logger.info("Event list empty but jobs in flight; probing jobtap for quiescence")
+                self.flux_handle.rpc(
+                    "job-manager.emu-jobtap.quiescent",
+                    payload=json.dumps({"time": self.current_time})   
+                ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
+                return  
             else:
                 print(f"completes {self.num_complete} submits {self.num_submits}")
-                logger.info(
-                    "No more events in event list, running post-sim analysis")
+                logger.info("No more events in event list, running post-sim analysis")
                 self.post_verification()
                 logger.info("Ending simulation")
                 self.flux_handle.reactor_stop(self.flux_handle.get_reactor())
-                return  
+                return
         logger.info("Fast-forwarding time to {}".format(self.current_time))
+
         if len(events_at_time) > 0:
             for event in events_at_time:
                 event()
-            logger.info(
-                "Sending quiescent request for time {}".format(self.current_time))
-            self.flux_handle.rpc("job-manager.quiescent", {"time": self.current_time}).then(
-                lambda fut, arg: arg.quiescent_cb(), arg=self
-            )
-        self.job_manager_quiescent = False
 
-    def is_quiescent(self):
-        '''
-        Checks for some conditions that imply the system is not quiescent
-        '''
-        return self.job_manager_quiescent and len(self.pending_inactivations) == 0
+            expect = self.step_expect.get(self.current_time,
+                                        {"submits": 0, "finishes": 0})
+            payload = {
+                "time": self.current_time,
+                "expect": {
+                    "submits": int(expect["submits"]),
+                    "finishes": int(expect["finishes"]),
+                },
+            }
+            self.flux_handle.rpc(
+                "job-manager.emu-jobtap.quiescent",
+                payload=json.dumps(payload)     
+            ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
+
+            # Only delete if it existed
+            if self.current_time in self.step_expect:
+                del self.step_expect[self.current_time]
+
+    # def is_quiescent(self):
+    #     '''
+    #     Checks for some conditions that imply the system is not quiescent
+    #     '''
+    #     return self.job_manager_quiescent and len(self.pending_inactivations) == 0
 
     def quiescent_cb(self):
         '''
@@ -432,20 +443,9 @@ class Simulation(object):
 
         Will call advance if it becomes idle after waiting for 100ms 
         '''
-        logger.info("Received a response indicating the system is quiescent")
+        logger.info("Quiescent confirmed by jobtap")
         self.job_manager_quiescent = True
-
-        if self.is_quiescent():
-            self.pending_continuation = False
-            logger.info("Scheduling next advance after 100ms delay")
-            self.timer = TimerWatcher(
-                self.flux_handle,
-                0.6,
-                self.advance
-            )
-            self.timer.start()
-        else:
-            logger.info("Ending from quiescent")
+        self.advance()
 
 
     def post_verification(self):
@@ -468,35 +468,42 @@ class Simulation(object):
                     logger.debug(pretty_str)
 
     def dump_eventlog(self):
-        '''
-        prints the eventlog to a csv
+        """
+        Print job eventlog to CSV.
 
-        #TODO make this more configurable 
-        '''
+        Many Flux eventlog entries have name="event" and the verb in "type".
+        Prefer "type", with a fallback to "name".
+        """
         fieldnames = [
-            "jobid", "submit", "validate", "depend", "priority", 
+            "jobid", "submit", "validate", "depend", "priority",
             "alloc", "start", "finish", "release", "free", "clean"
         ]
-        
+
         with open("eventlog.csv", "w", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for jobid, job in six.iteritems(self.job_map):
                 eventlog = flux.job.job_kvs_lookup(self.flux_handle, jobid, keys=["eventlog"])
-                
+
                 row = {"jobid": jobid}
                 for event in fieldnames[1:]:
                     row[event] = ""
-                
-                lines = eventlog["eventlog"].strip().split("\n")
+
+                lines = (eventlog.get("eventlog") or "").strip().split("\n")
                 for line in lines:
+                    if not line.strip():
+                        continue
                     parsed = json.loads(line)
-                    evt = parsed.get("name", parsed.get("type", "")).lower()
-                    if evt in fieldnames[1:]:
-                        if not row[evt]:
-                            row[evt] = parsed.get("timestamp", "")
+
+                    # Prefer "type" (common), fall back to "name" (sometimes holds the verb)
+                    evt = (parsed.get("type") or parsed.get("name") or "").lower()
+
+                    if evt in row and not row[evt]:
+                        row[evt] = parsed.get("timestamp", "")
+
                 writer.writerow(row)
+
 
 
 def datetime_to_epoch(dt):
@@ -793,14 +800,13 @@ def job_exception_cb(flux_handle, watcher, msg, cb_args):
 
 
 def sim_exec_start_cb(flux_handle, watcher, msg, simulation):
-    '''
-    callback that is invoked whenever jobs reach the start state in the job manager
-    '''
+    """
+    Invoked when job-manager asks exec to start a job.
+    Delegate to Simulation.start_job so we don't double-book resources or events.
+    """
     payload = msg.payload
-    logger.log(9, "Received sim-exec.start request. Payload: {}".format(payload))
     jobid = payload["id"]
     simulation.start_job(jobid, msg)
-
 
 def exec_hello(flux_handle):
     '''
@@ -822,18 +828,10 @@ def service_remove(f, name):
 
 
 def journal_event_cb(event, simulation):
-    """Callback invoked for each event from JournalConsumer."""
     if event is None:
         return
-
-    # Each 'event' is a JournalEvent with attributes like:
-    #   event.name       (e.g. 'submit', 'alloc', 'start', 'cleanup', 'inactive')
-    #   event.jobid
-    #   event.timestamp
-    #   event.jobspec    (if event.name == 'submit')
-    #   event.R          (if event.name == 'alloc')
-    #
-    if event.name.lower() == "clean":
+    name = event.name.lower()
+    if name in ("inactive", "clean"):
         simulation.record_job_state_transition(event.jobid, "INACTIVE")
 
 
@@ -1055,7 +1053,7 @@ def main():
     for job in jobs:
         job.insert_apriori_events(simulation)
     scheduler = 1
-    reload_modules(flux_handle, scheduler, queue_policy="fcfs")
+    reload_modules(flux_handle, scheduler, queue_policy="conservative")
 
     load_missing_modules(flux_handle )
     watchers, services = setup_watchers(flux_handle, simulation)
