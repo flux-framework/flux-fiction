@@ -24,23 +24,59 @@ from flux.resource import Rlist
 from flux.job import JournalConsumer
 import time
 
+import os
+TIME_QUANTUM = 1e-6  
 
-def create_resource(res_type, count, with_child=[]):
+def qtime(t) -> float:
+    return round(float(t) / TIME_QUANTUM) * TIME_QUANTUM
+
+_EVENT_LOG_FILE = "event_order_log.csv"
+_EVENT_LOG_HEADER_WRITTEN = False
+
+def log_event_execution(rows):
+    global _EVENT_LOG_HEADER_WRITTEN
+    write_header = not _EVENT_LOG_HEADER_WRITTEN or not os.path.exists(_EVENT_LOG_FILE)
+    with open(_EVENT_LOG_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "time", "idx_in_bucket", "kind", "jobid", "trace_idx",
+            "insertion_seq", "real_ts"
+        ])
+        if write_header:
+            w.writeheader()
+            _EVENT_LOG_HEADER_WRITTEN = True
+        for r in rows:
+            w.writerow(r)
+
+_event_seq_counter = 0
+
+def make_tagged_cb(kind, job, fn, time_value):
+    """Wrap a callback so we can log its kind and identity later."""
+    global _event_seq_counter
+    seq = _event_seq_counter
+    _event_seq_counter += 1
+
+    def cb():
+        return fn()
+
+    # attach debug metadata to the function object
+    cb._ev_kind = kind                    
+    cb._ev_time = time_value
+    cb._ev_seq_add = seq                    
+    cb._ev_jobid = getattr(job, "jobid", None) if job else None
+    cb._ev_trace_idx = getattr(job, "trace_index", None) if job else None
+    return cb
+
+def create_resource(res_type, count, with_child=None):
     '''
     Creates a resource dictionary for a Job
 
     Note: 'count' variable must be of type int. Otherwise it will cause issues during scheduling. 
     '''
-    assert isinstance(
-        with_child, Sequence), "child resource must be a sequence"
-    assert not isinstance(
-        with_child, str), "child resource must not be a string"
-    assert count > 0, "resource count must be > 0"
-    assert isinstance(count, int), "Count parameter must be of type int"
+    assert isinstance(count, int) and count > 0
     res = {"type": res_type, "count": count}
-
-    if len(with_child) > 0:
-        res["with"] = with_child
+    if with_child:
+        assert isinstance(with_child, Sequence) and not isinstance(with_child, str)
+        res["with"] = list(with_child)
     return res
 
 
@@ -48,7 +84,7 @@ def create_slot(label, count, with_child):
     '''
     Helper function for creating the slot section of a jobspec for a Job
     '''
-    slot = create_resource("slot", math.ceil(count), with_child)
+    slot = create_resource("slot", math.ceil(count), with_child or [])
     slot["label"] = label
     return slot
 
@@ -74,6 +110,10 @@ class Job(object):
         self._jobspec = None
         self._submit_future = None
         self._start_msg = None
+        self.trace_index = None     # set from reader order (see below)
+        self.real_submit = None     # time.time() at actual submit()
+        self.real_start  = None     # time.time() when sim_exec.start processed
+        self.real_finish = None     # time.time() when complete_job() runs
 
     @property
     def jobspec(self):
@@ -105,7 +145,7 @@ class Job(object):
             "version": 1,
             "resources": [resource_section],
             "tasks": [{
-                "command": ["sleep", "0"],
+                "command": ["command", "200"],
                 "slot": "task",
                 "count": {"per_slot": 1},
             }],
@@ -123,27 +163,17 @@ class Job(object):
 
 
     def submit(self, flux_handle):
-        '''
-        Used to asynchronously submit a job to Flux 
-        '''
         jobspec_json = json.dumps(self.jobspec)
         logger.log(9, jobspec_json)
-        flags = 0
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Submitting job with FLUX_JOB_DEBUG enabled")
-            flags = flux.constants.FLUX_JOB_DEBUG
-        self._submit_future = flux.job.submit_async(flux_handle, jobspec_json)
+        self.real_submit = time.time()          
+        self._jobid = flux.job.submit(flux_handle, jobspec_json)
+        logger.debug("Submitted job id %s", self._jobid)
+
 
     @property
     def jobid(self):
-        if self._jobid is None:
-            if self._submit_future is None:
-                raise ValueError("Job was not submitted yet. No ID assigned.")
-            logger.log(9, "Waiting on jobid")
-            self._jobid = flux.job.submit_get_id(self._submit_future)
-            self._submit_future = None
-            logger.log(9, "Received jobid: {}".format(self._jobid))
         return self._jobid
+
 
     @property
     def complete_time(self):
@@ -155,12 +185,10 @@ class Job(object):
         '''
         Records the time that the job was started by Flux and tells the job manager that the request is being handled
         '''
-        self.start_time = start_time
+        self.start_time = qtime(start_time)          # quantize here
         self._start_msg = start_msg
-        flux_handle.respond(
-            self._start_msg, payload={
-                "id": self.jobid, "type": "start", "data": {}}
-        )
+        flux_handle.respond(self._start_msg,
+                            payload={"id": self.jobid, "type": "start", "data": {}})
 
     def complete(self, flux_handle):
         '''
@@ -193,8 +221,8 @@ class Job(object):
         # TODO: add priority to `add_event` so that all submits for a given time
         # can happen consecutively, followed by the waits for the jobids
         simulation.step_expect[self.submit_time]["submits"] += 1
-        simulation.add_event(
-            self.submit_time, lambda: simulation.submit_job(self))
+        cb = make_tagged_cb("submit", self, lambda: simulation.submit_job(self), self.submit_time)
+        simulation.add_event(self.submit_time, cb)   # no other changes needed
 
     def record_state_transition(self, state, time):
         '''
@@ -214,7 +242,7 @@ class EventList(six.Iterator):
     '''
     def __init__(self):
         self.time_heap = []
-        self.time_map = {}
+        self.time_map = {}    
         self._current_time = None
 
     def add_event(self, time, callback):
@@ -244,17 +272,13 @@ class EventList(six.Iterator):
         return self
 
     def min(self):
-        if self.time_heap:
-            return self.time_heap[0]
-        else:
-            return None
+        return self.time_heap[0] if self.time_heap else None
 
     def max(self):
-        if self.time_heap:
-            time = max(self.time_map.keys())
-            return self.time_map[time]
-        else:
+        if not self.time_heap:
             return None
+        time = max(self.time_map.keys())
+        return self.time_map[time]
 
     def __next__(self):
         try:
@@ -294,6 +318,8 @@ class Simulation(object):
         self.complete_job_hook = complete_job_hook
         self.pending_continuation = False
         self.step_expect = defaultdict(lambda: {"submits": 0, "finishes": 0})
+        self.time_step = 0
+        self.pending_start_msgs = {} 
 
     def add_event(self, time, callback):
         '''
@@ -303,12 +329,10 @@ class Simulation(object):
         '''
         self.event_list.add_event(time, callback)
 
+
     def submit_job(self, job):
-        '''
-        Invokes the job submit function for a specific job and records the state transition in its state transition dict
-        '''
         self.num_submits += 1
-        job.record_state_transition("SUBMITTED", self.current_time)
+        job.record_state_transition("SUBMITTED", qtime(self.current_time))  
         if self.submit_job_hook:
             self.submit_job_hook(self, job)
         logger.debug("Submitting a new job")
@@ -318,16 +342,15 @@ class Simulation(object):
 
     def start_job(self, jobid, start_msg):
         job = self.job_map[jobid]
-        job.record_state_transition("STARTED", self.current_time)
+        job.record_state_transition("STARTED", qtime(self.current_time))
+        job.real_start = time.time()
         if self.start_job_hook:
             self.start_job_hook(self, job)
         job.start(self.flux_handle, start_msg, self.current_time)
 
-        # schedule completion
-        ct = job.complete_time
-        self.add_event(ct, lambda: self.complete_job(job))
-
-        # record expectations for that completion step
+        ct = qtime(job.complete_time)
+        cb = make_tagged_cb("complete", job, lambda: self.complete_job(job), ct)
+        self.add_event(ct, cb)                   # completes get tagged now
         self.step_expect[ct]["finishes"] += 1
 
 
@@ -338,35 +361,22 @@ class Simulation(object):
         This is used to trigger the finish and release events for a job when the time to complete it is reached
         '''
         self.num_complete += 1
-        job.record_state_transition("COMPLETED", self.current_time)
+        t = qtime(self.current_time)
+        job.record_state_transition("COMPLETED", t)
+        job.record_state_transition("INACTIVE", t)
+        job.real_finish = time.time() 
+
         if self.complete_job_hook:
             self.complete_job_hook(self, job)
         job.complete(self.flux_handle)
         logger.info("Completed job {}".format(job.jobid))
-        # self.pending_inactivations.add(job)
 
 
     def record_job_state_transition(self, jobid, state):
-        """
-        This is called whenever the job manager records the "COMPLETED" event within the event journal for a specific job
+        logger.log(9, "record_job_state_transition ignored (now simulator-owned): job=%s state=%s",
+                jobid, state)
 
-        This means cleanup for the job is finished and the resources have been released by the scheduler
-        """
-
-        job = self.job_map[jobid]
-        job.record_state_transition(state, self.current_time)
-        if state == 'INACTIVE' and job in self.pending_inactivations:
-            # Have to add this event or the emulator will try to exit before actually running the next job if there is one
-            # Needs to be revisited
-            # self.add_event(self.current_time + 1e-9, lambda: None)
-            self.pending_inactivations.remove(job)
-            # if self.is_quiescent():
-            #     self.pending_continuation = False
-            #     print("advancing from state transition")
-            #     self.flux_handle.rpc("job-manager.emu-jobtap.quiescent", {"time": self.current_time}).then(
-            #     lambda fut, arg: arg.quiescent_cb(), arg=self
-            #     )
-
+    
     def advance(self, *args, **kwargs):
         '''
         "Internal" loop for the emulator.
@@ -409,27 +419,50 @@ class Simulation(object):
                 return
         logger.info("Fast-forwarding time to {}".format(self.current_time))
 
-        if len(events_at_time) > 0:
-            for event in events_at_time:
-                event()
+        # record execution order exactly as it will happen
+        _exec_rows = []
+        for i, cb in enumerate(events_at_time):
+            kind = getattr(cb, "_ev_kind", "other")
+            jobid = getattr(cb, "_ev_jobid", None)
+            trace_idx = getattr(cb, "_ev_trace_idx", None)
+            ins_seq = getattr(cb, "_ev_seq_add", None)
+            _exec_rows.append({
+                "time": f"{float(self.current_time):.6f}",
+                "idx_in_bucket": i,
+                "kind": kind,
+                "jobid": jobid,
+                "trace_idx": trace_idx,
+                "insertion_seq": ins_seq,
+                "real_ts": f"{time.time():.6f}",
+            })
 
-            expect = self.step_expect.get(self.current_time,
-                                        {"submits": 0, "finishes": 0})
-            payload = {
-                "time": self.current_time,
-                "expect": {
-                    "submits": int(expect["submits"]),
-                    "finishes": int(expect["finishes"]),
-                },
-            }
-            self.flux_handle.rpc(
-                "job-manager.emu-jobtap.quiescent",
-                payload=json.dumps(payload)     
-            ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
+        # write the snapshot for this bucket
+        log_event_execution(_exec_rows)
 
-            # Only delete if it existed
-            if self.current_time in self.step_expect:
-                del self.step_expect[self.current_time]
+        # run callbacks exactly once
+        for cb in events_at_time:
+            cb()
+
+        if self.time_step == 0:
+            time.sleep(0.5)
+            self.time_step+=1
+
+        # build expect and probe (no second execution loop!)
+        expect = self.step_expect.get(self.current_time, {"submits": 0, "finishes": 0})
+        payload = {
+            "time": self.current_time,
+            "expect": {
+                "submits": int(expect["submits"]),
+                "finishes": int(expect["finishes"]),
+            },
+        }
+        self.flux_handle.rpc(
+            "job-manager.emu-jobtap.quiescent",
+            payload=json.dumps(payload)
+        ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
+
+        if self.current_time in self.step_expect:
+            del self.step_expect[self.current_time]
 
     # def is_quiescent(self):
     #     '''
@@ -554,15 +587,13 @@ def job_from_slurm_row(row):
     '''
     kwargs = {}
     if "ExitCode" in row and row["ExitCode"]:
-        # sacct ExitCode is often "0:0"; take primary code
         try:
             kwargs["exitcode"] = int(str(row["ExitCode"]).split(":")[0])
         except Exception:
             kwargs["exitcode"] = 0
 
-    submit_time = datetime_to_epoch(
-        datetime.strptime(row["Submit"], "%Y-%m-%dT%H:%M:%S")
-    )
+    submit_time = qtime(datetime_to_epoch(datetime.strptime(row["Submit"], "%Y-%m-%dT%H:%M:%S")))
+
     elapsed = walltime_str_to_timedelta(row["Elapsed"]).total_seconds()
     if elapsed <= 0:
         logger.warning("Elapsed time ({}) <= 0".format(elapsed))
@@ -713,7 +744,7 @@ def load_missing_modules(flux_handle):
     pass
 
 
-def reload_modules(flux_handle, scheduler, queue_policy = "fcfs"):
+def reload_modules(flux_handle, scheduler, queue_policy = "fcfs", match_policy="first"):
     '''
     To make the resource.R that we submitted to KVS earlier register with the 
     Flux instance, we need to reload both the resource module and scheduler in 
@@ -779,7 +810,7 @@ def reload_modules(flux_handle, scheduler, queue_policy = "fcfs"):
                                 "path": path, "args": []}).get()
             else:
                 flux_handle.rpc("module.load", payload={
-                                "path": fluxion_resource_path, "args": []}).get()
+                                "path": fluxion_resource_path, "args": [f"match-policy={match_policy}"]}).get()
                 # "queue-policy=conservative"
                 flux_handle.rpc("module.load", payload={
                                 "path": fluxion_qmanager_path, "args": [f"queue-policy={queue_policy}"]}).get()
@@ -800,13 +831,35 @@ def job_exception_cb(flux_handle, watcher, msg, cb_args):
 
 
 def sim_exec_start_cb(flux_handle, watcher, msg, simulation):
-    """
-    Invoked when job-manager asks exec to start a job.
-    Delegate to Simulation.start_job so we don't double-book resources or events.
-    """
     payload = msg.payload
     jobid = payload["id"]
-    simulation.start_job(jobid, msg)
+
+    # Buffer the raw start request so we can ack it later in a batch
+    simulation.pending_start_msgs[jobid] = msg
+
+    # Tell jobtap we've received this start (async; no blocking inside watcher)
+    flux_handle.rpc(
+        "job-manager.emu-jobtap.buffer-start",
+        payload={"jobid": jobid}
+    ).then(lambda fut, arg: None, arg=None)
+    
+
+def sim_exec_flush_starts_cb(flux_handle, watcher, msg, simulation):
+    body = msg.payload or {}
+    jobids = body.get("jobids", [])
+
+    for jobid in jobids:
+        start_msg = simulation.pending_start_msgs.pop(jobid, None)
+        if start_msg is None:
+            logger.error("flush-starts: unknown jobid %s", jobid)
+            continue
+        # Now we actually "start" the job (records start time, schedules complete, sends ACK)
+        simulation.start_job(jobid, start_msg)
+
+    # reply to jobtap so it knows we accepted the flush
+    flux_handle.respond(msg, payload={"ok": True})
+
+
 
 def exec_hello(flux_handle):
     '''
@@ -828,11 +881,17 @@ def service_remove(f, name):
 
 
 def journal_event_cb(event, simulation):
+    """Journal is INFO-ONLY now; do not mutate simulator state here."""
     if event is None:
         return
-    name = event.name.lower()
-    if name in ("inactive", "clean"):
-        simulation.record_job_state_transition(event.jobid, "INACTIVE")
+    try:
+        name = event.name.lower()
+        jobid = event.jobid
+    except Exception:
+        name = getattr(event, "name", "?")
+        jobid = getattr(event, "jobid", "?")
+    logger.log(9, "journal event: %s job=%s", name, jobid)
+
 
 
 def setup_journal(flux_handle, simulation):
@@ -861,6 +920,7 @@ def setup_watchers(flux_handle, simulation):
             sim_exec_start_cb,
             simulation,
         ),
+        (flux.constants.FLUX_MSGTYPE_REQUEST, "sim-exec.flush-starts",  sim_exec_flush_starts_cb, simulation),
     ]:
         watcher = flux_handle.msg_watcher_create(
             cb, type_mask=type_mask, topic_glob=topic, args=args
@@ -997,22 +1057,41 @@ class SimpleExec(object):
 logger = logging.getLogger("flux-emulator")
 
 def dump_transitions_to_csv(simulation, filename="job_transitions.csv"):
-    '''
-    This notes all of the submit, start, and end times of the jobs in the simulation
-    '''
-    fieldnames = ["jobid", "SUBMIT", "START", "FINISH", "nnodes"]
+    def f(x):
+        return "" if x in (None, "") else f"{float(x):.6f}"
+
+    rows = []
+    for jobid, job in simulation.job_map.items():
+        rows.append({
+            "trace_idx": job.trace_index,              
+            "jobid": jobid,                            
+            "nnodes": job.nnodes,
+
+            # simulator times (simulated epoch secs)
+            "SUBMIT": f(job.state_transitions.get("SUBMITTED", "")),
+            "START":  f(job.state_transitions.get("STARTED", "")),
+            "FINISH": f(job.state_transitions.get("COMPLETED", "")),
+
+            # real wall-clock times when we actually observed/issued them
+            "REAL_SUBMIT": f(job.real_submit),
+            "REAL_START":  f(job.real_start),
+            "REAL_FINISH": f(job.real_finish),
+        })
+
+    # stable sort: by trace order, then by real submit (to debug)
+    rows.sort(key=lambda r: (r["trace_idx"] if r["trace_idx"] is not None else 10**9,
+                             float(r["REAL_SUBMIT"]) if r["REAL_SUBMIT"] else float("inf")))
+
+    fieldnames = ["trace_idx", "jobid", "nnodes",
+                  "SUBMIT", "START", "FINISH",
+                  "REAL_SUBMIT", "REAL_START", "REAL_FINISH"]
     with open(filename, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for jobid, job in simulation.job_map.items():
-            row = {
-                "jobid": jobid,
-                "SUBMIT": job.state_transitions.get("SUBMITTED", ""),
-                "START": job.state_transitions.get("STARTED", ""),
-                "FINISH": job.state_transitions.get("COMPLETED", ""),
-                "nnodes": job.nnodes
-            }
-            writer.writerow(row)
+        w = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
 
 @flux.util.CLIMain(logger)
 def main():
@@ -1047,13 +1126,21 @@ def main():
     reader.validate_trace()
     insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
     jobs = list(reader.read_trace())
+
+    # Attach a traceable index to jobs for use in identifying jobs cross-run when their ID has changed
+    for idx, job in enumerate(jobs):
+        job.trace_index = idx  
+
     if args.exclusive:
         for job in jobs:
             job.set_exclusive(args.cores_per_rank, args.gpus_per_rank)
     for job in jobs:
         job.insert_apriori_events(simulation)
     scheduler = 1
-    reload_modules(flux_handle, scheduler, queue_policy="conservative")
+
+    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
+    # function paramater for every single module paramter 
+    reload_modules(flux_handle, scheduler, queue_policy="easy", match_policy="lonode")
 
     load_missing_modules(flux_handle )
     watchers, services = setup_watchers(flux_handle, simulation)

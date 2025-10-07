@@ -4,6 +4,7 @@
 #include <flux/core.h>
 #include <flux/jobtap.h>
 #include <jansson.h> 
+#include <unistd.h>
 
 #define PLUGIN_NAME "emu-jobtap"
 
@@ -38,6 +39,8 @@ struct emulator {
     u_int64_t timestep;
 
     unsigned long long alloc_needed;
+    json_t *buf_jobids;              
+    flux_future_t *flush_req;       
 };
 
 /* helpers */
@@ -53,6 +56,8 @@ static void emulator_destroy(struct emulator *emu) {
     if (emu->sim_req)   flux_msg_destroy(emu->sim_req);
     free(emu);
     errno = saved;
+    if (emu->flush_req) flux_future_destroy(emu->flush_req);
+    if (emu->buf_jobids) json_decref(emu->buf_jobids);
 }
 
 static inline unsigned long long delta(unsigned long long total,
@@ -105,6 +110,74 @@ static void log_snapshot(struct emulator *emu, const char *where)
     );
 }
 
+static void flush_starts_continuation (flux_future_t *f, void *arg)
+{
+    struct emulator *emu = arg;
+    if (!emu) {
+        flux_future_destroy(f);
+        return;
+    }
+
+    if (flux_rpc_get(f, NULL) < 0) {
+        flux_log_error(emu->h, "flush-starts failed: %s",
+                       flux_future_error_string(f));
+    } else {
+        flux_log(emu->h, LOG_DEBUG, "flush-starts acked");
+    }
+
+    flux_future_destroy(f);
+    emu->flush_req = NULL;
+
+}
+
+
+static void try_flush_batched_starts(struct emulator *emu)
+{
+    if (!emu || !emu->sched_quiescent_ok) return;
+    if (emu->flush_req) return; 
+
+    unsigned long long started_since_wm = delta(emu->tot_start, emu->wm_start);
+    unsigned long long need = (emu->alloc_needed > started_since_wm)
+                            ? (emu->alloc_needed - started_since_wm) : 0ULL;
+    if (need == 0) return;
+
+    size_t have = emu->buf_jobids ? json_array_size(emu->buf_jobids) : 0;
+    if (have < need) {
+
+        return;
+    }
+
+    // Build payload: first `need` jobids
+    json_t *root = json_object();
+    json_t *arr  = json_array();
+    for (size_t i = 0; i < need; ++i) {
+        json_t *jid = json_array_get(emu->buf_jobids, 0); 
+        if (!jid) break;
+        json_array_append(arr, jid);
+        json_array_remove(emu->buf_jobids, 0);
+    }
+    json_object_set_new(root, "jobids", arr);
+
+    char *s = json_dumps(root, 0);
+    json_decref(root);
+    if (!s) return;
+
+    emu->flush_req = flux_rpc(emu->h, "sim-exec.flush-starts", s, 0, 0);
+    free(s);
+    if (!emu->flush_req) {
+        flux_log_error(emu->h, "flush-starts rpc failed");
+        return;
+    }
+
+    if (flux_future_then(emu->flush_req, -1, flush_starts_continuation, emu) < 0) {
+        flux_log_error(emu->h, "future_then failed");
+        flux_future_destroy(emu->flush_req);
+        emu->flush_req = NULL;
+        return;
+    }
+}
+
+
 /* Pre-probe gating: ONLY these two before calling scheduler */
 static bool preprobe_expectations_met(struct emulator *emu) {
     unsigned long long d_sched    = delta(emu->tot_sched,    emu->wm_sched);
@@ -137,7 +210,6 @@ static bool postprobe_alloc_to_start_met(struct emulator *emu) {
 
 static void reply_and_advance(struct emulator *emu) {
     if (!emu->sim_req) return;
-
     const char *echo = NULL;
     (void)flux_msg_get_string(emu->sim_req, &echo);
 
@@ -227,6 +299,7 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
 
             emu->sched_quiescent_ok = (status == 0);
             emu->alloc_needed = alloc_current;
+            try_flush_batched_starts(emu);
 
             flux_log(emu->h, LOG_DEBUG,
                      "sched_quiescent_continuation: status=%d alloc_current=%llu",
@@ -447,6 +520,38 @@ static int cb_job_state_inactive (flux_plugin_t *p, const char *topic,
     return 0;
 }
 
+static void buffer_start_cb(flux_t *h, flux_msg_handler_t *mh,
+                            const flux_msg_t *msg, void *arg)
+{
+    struct emulator *emu = arg;
+    const char *payload = NULL;
+    (void)flux_msg_get_string(msg, &payload);
+
+    json_error_t jerr;
+    json_t *root = json_loads(payload ? payload : "{}", 0, &jerr);
+    if (!root) {
+        flux_respond_error(h, msg, EINVAL, "bad JSON");
+        return;
+    }
+    json_t *jid = json_object_get(root, "jobid");
+    if (!jid || !json_is_integer(jid)) {
+        json_decref(root);
+        flux_respond_error(h, msg, EINVAL, "missing jobid");
+        return;
+    }
+
+    if (!emu->buf_jobids)
+        emu->buf_jobids = json_array();
+    json_array_append_new(emu->buf_jobids, json_integer(json_integer_value(jid)));
+    json_decref(root);
+
+    flux_respond(h, msg, "{}");
+
+  
+    try_flush_batched_starts(emu);
+}
+
+
 /* plugin init */
 
 int flux_plugin_init (flux_plugin_t *p)
@@ -472,6 +577,8 @@ int flux_plugin_init (flux_plugin_t *p)
     flux_plugin_add_handler(p, "job.event.alloc",    cb_job_event_alloc,    emu);
     flux_plugin_add_handler(p, "job.event.start",    cb_job_event_start,    emu);
     flux_plugin_add_handler(p, "job.state.inactive", cb_job_state_inactive, emu);
+    flux_jobtap_service_register(p, "buffer-start", buffer_start_cb, emu);
+
 
     return 0;
 }
