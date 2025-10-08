@@ -740,11 +740,12 @@ def load_missing_modules(flux_handle):
     # TODO: check that necessary modules are loaded
     # if not, load them
     # return an updated list of loaded modules
+    # Should be checking for the jobtap module
     loaded_modules = get_loaded_modules(flux_handle)
     pass
 
 
-def reload_modules(flux_handle, scheduler, queue_policy = "fcfs", match_policy="first"):
+def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
     '''
     To make the resource.R that we submitted to KVS earlier register with the 
     Flux instance, we need to reload both the resource module and scheduler in 
@@ -1095,24 +1096,44 @@ def dump_transitions_to_csv(simulation, filename="job_transitions.csv"):
 
 @flux.util.CLIMain(logger)
 def main():
+
+    # ______________________________
+    # --- INITIALIZATION PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
     parser = argparse.ArgumentParser()
+
+    # The file that contains the job traces being input into the program. Should be in the sacct trace format
     parser.add_argument("job_file")
+
+    # The number of nodes that are used for the simulated system configuration
     parser.add_argument("num_ranks", type=int)
+
+    # The number of cores that are used per node in the simulated system configuration
     parser.add_argument("cores_per_rank", type=int)
-    parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0,
-                        help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
-    parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int,
-                        help="Override GPUs per rank/node (same as optional 3rd positional)")
+
+    # The number of GPUs that are used per node in the simulated system configuration
+    # Can be 3rd positional argument or specified with flags
+    parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0, help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
+    parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int, help="Override GPUs per rank/node (same as optional 3rd positional)")
+
+    # Specifies log level for Flux
+    # TODO: Logging isnt currently working. It could be because Im just not specifying a log level when i run the program. There is no default
     parser.add_argument("--log-level", type=int)
-    parser.add_argument("--exclusive", action="store_true",
-                    help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
+
+    # Flag to specify whether nodes will be counted as exclusive or not
+    # (you only have to say the job needs 1 node and the program assumes you want all the cores and gpus in a node)
+    parser.add_argument("--exclusive", action="store_true", help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
     args = parser.parse_args()
 
+    # Set log level in Flux from the input parameter 
     if args.log_level:
         logger.setLevel(args.log_level)
 
+    # Get the flux handle
     flux_handle = flux.Flux()
 
+    # Configure our simulated exec system and the user event simulator
     exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank, exclusive=args.exclusive)
     simulation = Simulation(
         flux_handle,
@@ -1122,53 +1143,79 @@ def main():
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
     )
+
+    # Take the system resource configuration and put it in the KVS 
+    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
+
+    #
+    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
+    # function paramater for every single module paramter 
+    reload_modules(flux_handle, queue_policy="easy", match_policy="lonode")
+
+    # Read in the job traces from the specified file and make a list of jobs
     reader = SacctReader(args.job_file, require_gpus=(args.gpus_per_rank and args.gpus_per_rank > 0))
     reader.validate_trace()
-    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
     jobs = list(reader.read_trace())
-
+    
     # Attach a traceable index to jobs for use in identifying jobs cross-run when their ID has changed
     for idx, job in enumerate(jobs):
         job.trace_index = idx  
 
+    # Set jobs as exclusive if applicable and insert the jobs start times into the event list in our user-event simulator    
     if args.exclusive:
         for job in jobs:
             job.set_exclusive(args.cores_per_rank, args.gpus_per_rank)
     for job in jobs:
         job.insert_apriori_events(simulation)
-    scheduler = 1
 
-    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
-    # function paramater for every single module paramter 
-    reload_modules(flux_handle, scheduler, queue_policy="easy", match_policy="lonode")
+    # TODO: Should be checking to see if the jobtap plugin is loaded 
+    load_missing_modules(flux_handle)
 
-    load_missing_modules(flux_handle )
+    # Configure RPC endpoints/watchers for our program
     watchers, services = setup_watchers(flux_handle, simulation)
+
+    # TODO: Remove everything related to journal consumer. This is junk 
     consumer = setup_journal(flux_handle, simulation)
+
+    # Register the exec system simulator as the exec system that we are using for Flux
     exec_hello(flux_handle)
+    
+    # __________________________
+    # --- SIMULATION PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+    # Begin the primary event loop of the user event simulator 
     simulation.advance()
 
+    # ________________________
+    # --- POST-SIM PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾ 
+
+    # Run the last set of events in the reactor. If we arent able to, we encountered an exception in our simulation
     try:
         flux_handle.reactor_run(flux_handle.get_reactor(), 0)
     except Exception as e:
         logger.error(f"Reactor encountered an exception: {e}")
+
+    # Get rid of the watchers/services that we used in our simulation
     try:
         teardown_watchers(flux_handle, watchers, services)
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
+
+    # Print out the results of the simulation
     exec_validator.post_analysis(simulation)
+
+    # I had to put this delay previously because the eventlog wasn't done being updated 
+    # sometimes when we finished and we had to wait a few seconds for it to finish updating
+    # Probably a better method
     time.sleep(2)
+
+    # Dump Flux's own eventlog
     simulation.dump_eventlog()
 
+    # Dump out our own transition log to the file
     dump_transitions_to_csv(simulation, "job_transitions.csv")
-    # print("Job Life Cycle Transitions:")
-    # for jobid, job in simulation.job_map.items():
-    #     print("Job {}:".format(jobid))
-    #     for state, timestamp in job.state_transitions.items():
-    #         print("  {} at time {}".format(state, timestamp))
-
-    
-
 
 if __name__ == "__main__":
     main()
