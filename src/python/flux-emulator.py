@@ -951,7 +951,17 @@ Makespan = namedtuple('Makespan', ['beginning', 'end'])
 
 class SimpleExec(object):
     '''
-    Simple exec module that is used to simulate the execution of jobs in the eyes of Flux
+    This module is a simulator for job execution. It is loaded like a broker module in Flux
+
+    The exact behavior of SimpleExec currently is to recieve start job notifications from the 
+    job manager in Flux, notify the user-event simulator, mark down bookkeeping information
+    about jobs, send an ackowledgment to the job manager that jobs are starting, and handle
+    requests from the user-event simulator to end jobs.
+
+    One behavior to note is that this will currently buffer the start acknowledgements for jobs
+    to the job manager and flush them at the end of each timestep in the user-event simulator.
+    This is planned to become togglable soon. It is more realistic to not batch the acks but 
+    it is useful to make times line up properly.
     '''
     def __init__(self, num_nodes, cores_per_node, gpus_per_node=0, exclusive=False):
         self.num_nodes = num_nodes
@@ -1126,7 +1136,7 @@ def main():
     parser.add_argument("--exclusive", action="store_true", help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
     args = parser.parse_args()
 
-    # Set log level in Flux from the input parameter 
+    # Set log level from the input parameter 
     if args.log_level:
         logger.setLevel(args.log_level)
 
