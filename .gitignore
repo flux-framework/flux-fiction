@@ -2,3 +2,7 @@
 job_transitions.csv
 /util/broker-logs.txt
 eventlog.csv
+/src/python/*.csv
+/src/python/*.json
+/src/python/out
+/src/python/variations*
