@@ -23,6 +23,8 @@ from flux.core.watchers import TimerWatcher
 from flux.resource import Rlist
 from flux.job import JournalConsumer
 import time
+from typing import List, Sequence, Union
+from tqdm import tqdm
 
 import os
 TIME_QUANTUM = 1e-6  
@@ -304,12 +306,14 @@ class Simulation(object):
             submit_job_hook=None,
             start_job_hook=None,
             complete_job_hook=None,
+            progress=None,
     ):
         self.event_list = event_list
         self.job_map = job_map
         self.current_time = 0
         self.flux_handle = flux_handle
         self.num_submits = 0
+        self.progress = progress
         self.num_complete = 0
         self.pending_inactivations = set()
         self.job_manager_quiescent = True
@@ -350,11 +354,8 @@ class Simulation(object):
 
         ct = qtime(job.complete_time)
         cb = make_tagged_cb("complete", job, lambda: self.complete_job(job), ct)
-        self.add_event(ct, cb)                   # completes get tagged now
+        self.add_event(ct, cb)                   
         self.step_expect[ct]["finishes"] += 1
-
-
-
 
     def complete_job(self, job):
         '''
@@ -369,6 +370,9 @@ class Simulation(object):
         if self.complete_job_hook:
             self.complete_job_hook(self, job)
         job.complete(self.flux_handle)
+        # Update tqdm progress bar
+        if self.progress is not None:
+            self.progress.update(1)
         logger.info("Completed job {}".format(job.jobid))
 
 
@@ -411,7 +415,7 @@ class Simulation(object):
                 ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
                 return  
             else:
-                print(f"completes {self.num_complete} submits {self.num_submits}")
+                logger.info(f"completes {self.num_complete} submits {self.num_submits}")
                 logger.info("No more events in event list, running post-sim analysis")
                 self.post_verification()
                 logger.info("Ending simulation")
@@ -740,11 +744,12 @@ def load_missing_modules(flux_handle):
     # TODO: check that necessary modules are loaded
     # if not, load them
     # return an updated list of loaded modules
+    # Should be checking for the jobtap module
     loaded_modules = get_loaded_modules(flux_handle)
     pass
 
 
-def reload_modules(flux_handle, scheduler, queue_policy = "fcfs", match_policy="first"):
+def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
     '''
     To make the resource.R that we submitted to KVS earlier register with the 
     Flux instance, we need to reload both the resource module and scheduler in 
@@ -950,7 +955,17 @@ Makespan = namedtuple('Makespan', ['beginning', 'end'])
 
 class SimpleExec(object):
     '''
-    Simple exec module that is used to simulate the execution of jobs in the eyes of Flux
+    This module is a simulator for job execution. It is loaded like a broker module in Flux
+
+    The exact behavior of SimpleExec currently is to recieve start job notifications from the 
+    job manager in Flux, notify the user-event simulator, mark down bookkeeping information
+    about jobs, send an ackowledgment to the job manager that jobs are starting, and handle
+    requests from the user-event simulator to end jobs.
+
+    One behavior to note is that this will currently buffer the start acknowledgements for jobs
+    to the job manager and flush them at the end of each timestep in the user-event simulator.
+    This is planned to become togglable soon. It is more realistic to not batch the acks but 
+    it is useful to make times line up properly.
     '''
     def __init__(self, num_nodes, cores_per_node, gpus_per_node=0, exclusive=False):
         self.num_nodes = num_nodes
@@ -1056,63 +1071,254 @@ class SimpleExec(object):
 
 logger = logging.getLogger("flux-emulator")
 
-def dump_transitions_to_csv(simulation, filename="job_transitions.csv"):
+def _expand_nodelist(nl: Union[str, Sequence[Union[str,int]]]) -> List[int]:
+    """
+    Convert typical Flux/host-style nodelists into integer node indices for lanes.
+    Accepts:
+      - "0,1,2-5,9"
+      - "node[01-03,07]"  -> 1,2,3,7
+      - ["node01","node02"] -> 1,2
+      - [0,1,2]
+    """
+    if nl is None:
+        return []
+    if isinstance(nl, (list, tuple)):
+        out = []
+        for item in nl:
+            if isinstance(item, int):
+                out.append(item)
+            else:
+                m = re.search(r'(\d+)$', str(item))
+                if m:
+                    out.append(int(m.group(1)))
+        return sorted(set(out))
+
+    s = str(nl).strip()
+    if not s:
+        return []
+
+    # bracketed ranges: prefix[1-3,7]
+    m = re.match(r'^(.*)\[(.+)\]$', s)
+    if m:
+        inside = m.group(2)
+        out = []
+        for part in inside.split(','):
+            part = part.strip()
+            if '-' in part:
+                a, b = part.split('-', 1)
+                a, b = int(a), int(b)
+                step = 1 if b >= a else -1
+                for v in range(a, b + step, step):
+                    out.append(v)
+            else:
+                out.append(int(part))
+        return sorted(set(out))
+
+    # plain list/ranges: "0,1,2-5,node12"
+    out = []
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            a, b = int(a), int(b)
+            step = 1 if b >= a else -1
+            out.extend(range(a, b + step, step))
+        else:
+            m = re.search(r'(\d+)$', part)
+            out.append(int(m.group(1)) if m else int(part))
+    return sorted(set(out))
+
+def flux_nodelist_by_id(flux_handle, jobid):
+    try:
+        from flux.job.list import job_list_id, get_job
+        rpc = job_list_id(flux_handle, int(jobid), attrs=["all"])
+        info = rpc.get_jobinfo()  
+        nl = getattr(info, "nodelist", "")
+        nodes = _expand_nodelist(nl)
+        if nodes:
+            return nodes
+
+        # Try unfiltered dict for inactive jobs 
+        jd = get_job(flux_handle, int(jobid))
+        if jd:
+            nl = jd.get("nodelist", "")
+            return _expand_nodelist(nl)
+    except Exception:
+        pass
+    return []
+
+def nodelist_lookup(jobid, job, flux_handle):
+    if flux_handle is not None:
+        nodes = flux_nodelist_by_id(flux_handle, jobid)
+        return nodes, "flux_nodelist" if nodes else "missing"
+    else:
+        raise Exception("dump_transitions_to_csv: You didn't pass the flux handle")
+        
+def dump_transitions_to_csv(
+    simulation,
+    filename="job_transitions.csv",
+    flux_handle=None,
+):
+    """
+    Writes job transitions CSV and adds NODELIST (comma-separated ints).
+    Nodelist is resolved via Flux job-list.list-id.
+    """
     def f(x):
         return "" if x in (None, "") else f"{float(x):.6f}"
 
     rows = []
     for jobid, job in simulation.job_map.items():
+        nodes, _ = nodelist_lookup(jobid, job, flux_handle)
         rows.append({
-            "trace_idx": job.trace_index,              
-            "jobid": jobid,                            
+            "trace_idx": job.trace_index,
+            "jobid": jobid,
             "nnodes": job.nnodes,
-
-            # simulator times (simulated epoch secs)
             "SUBMIT": f(job.state_transitions.get("SUBMITTED", "")),
             "START":  f(job.state_transitions.get("STARTED", "")),
             "FINISH": f(job.state_transitions.get("COMPLETED", "")),
-
-            # real wall-clock times when we actually observed/issued them
             "REAL_SUBMIT": f(job.real_submit),
             "REAL_START":  f(job.real_start),
             "REAL_FINISH": f(job.real_finish),
+            "NODELIST": ",".join(str(n) for n in nodes),
         })
 
-    # stable sort: by trace order, then by real submit (to debug)
-    rows.sort(key=lambda r: (r["trace_idx"] if r["trace_idx"] is not None else 10**9,
-                             float(r["REAL_SUBMIT"]) if r["REAL_SUBMIT"] else float("inf")))
+    rows.sort(key=lambda r: (
+        r["trace_idx"] if r["trace_idx"] is not None else 10**9,
+        float(r["REAL_SUBMIT"]) if r["REAL_SUBMIT"] else float("inf"))
+    )
 
     fieldnames = ["trace_idx", "jobid", "nnodes",
                   "SUBMIT", "START", "FINISH",
-                  "REAL_SUBMIT", "REAL_START", "REAL_FINISH"]
+                  "REAL_SUBMIT", "REAL_START", "REAL_FINISH",
+                  "NODELIST"]
     with open(filename, "w", newline="") as csvfile:
         w = csv.DictWriter(csvfile, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
+def _sec_to_us(x: Union[str, float, int]) -> int:
+    if x in ("", None):
+        return 0
+    return int(float(x) * 1_000_000.0)
+
+def write_per_node_chrome_trace(simulation, out_path="pernode_trace.json", flux_handle=None, pid: int = 1):
+    """
+    Generates a Chrome/Perfetto trace with one lane per node:
+      - tid = node index
+      - name = job{trace_idx}:{jobid}
+      - ts/dur from START..FINISH (sim time only; no submit/real times)
+
+    Open the JSON in https://ui.perfetto.dev to see an occupancy chart.
+    """
+    events = []
+    threads_emitted = set()
+
+    # Process label
+    events.append({
+        "name": "process_name", "ph": "M", "pid": pid,
+        "args": {"name": "Cluster"}
+    })
+    
+    # Build slices
+    for jobid, job in simulation.job_map.items():
+        start_s = job.state_transitions.get("STARTED", None)
+        finish_s = job.state_transitions.get("COMPLETED", None)
+        if start_s in (None, "") or finish_s in (None, ""):
+            continue
+        ts_us = _sec_to_us(start_s)
+        dur_us = _sec_to_us(finish_s) - ts_us
+        if dur_us <= 0:
+            continue
+
+        nodes, src = nodelist_lookup(jobid, job, flux_handle)
+        if not nodes:
+            continue
+
+        for n in nodes:
+            if n not in threads_emitted:
+                events.append({
+                    "name": "thread_name", "ph": "M", "pid": pid, "tid": int(n),
+                    "args": {"name": f"node {n}"}
+                })
+                events.append({
+                    "name": "thread_sort_index", "ph": "M", "pid": pid, "tid": int(n),
+                    "args": {"sort_index": int(n)}
+                })
+                threads_emitted.add(n)
+
+            events.append({
+                "name": f"job{getattr(job, 'trace_index', '')}:{jobid}",
+                "cat": "occupancy",
+                "ph": "X",
+                "pid": pid,
+                "tid": int(n),
+                "ts": ts_us,
+                "dur": dur_us,
+                "args": {"jobid": str(jobid), "trace_idx": getattr(job, "trace_index", None),
+                         "nnodes": getattr(job, "nnodes", None), "_source": src}
+            })
+
+    trace_obj = {"traceEvents": events, "displayTimeUnit": "ms"}
+    with open(out_path, "w") as f:
+        json.dump(trace_obj, f)
+
+
 
 
 @flux.util.CLIMain(logger)
 def main():
+
+    # ______________________________
+    # --- INITIALIZATION PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
     parser = argparse.ArgumentParser()
+
+    # The file that contains the job traces being input into the program. Should be in the sacct trace format
     parser.add_argument("job_file")
+
+    # The number of nodes that are used for the simulated system configuration
     parser.add_argument("num_ranks", type=int)
+
+    # The number of cores that are used per node in the simulated system configuration
     parser.add_argument("cores_per_rank", type=int)
-    parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0,
-                        help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
-    parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int,
-                        help="Override GPUs per rank/node (same as optional 3rd positional)")
-    parser.add_argument("--log-level", type=int)
-    parser.add_argument("--exclusive", action="store_true",
-                    help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
+
+    # The number of GPUs that are used per node in the simulated system configuration
+    # Can be 3rd positional argument or specified with flags
+    parser.add_argument("gpus_per_rank", nargs="?", type=int, default=0, help="(optional) GPUs per rank/node; enable GPU-aware mode if > 0")
+    parser.add_argument("--gpus-per-rank", dest="gpus_per_rank", type=int, help="Override GPUs per rank/node (same as optional 3rd positional)")
+
+    # Specifies log level for Flux
+    # TODO: Logging isnt currently working. It could be because Im just not specifying a log level when i run the program. There is no default
+    parser.add_argument("--log-level", type=int, help="Python logger level")
+    parser.add_argument("--log-file", default="emulator.log", help="Write logs to this file (default: emulator.log)")
+
+    # Flag to specify whether nodes will be counted as exclusive or not
+    # (you only have to say the job needs 1 node and the program assumes you want all the cores and gpus in a node)
+    parser.add_argument("--exclusive", action="store_true", help="Each job consumes all resources on its allocated nodes (ignore per-job CPU/GPU counts)")
     args = parser.parse_args()
 
-    if args.log_level:
-        logger.setLevel(args.log_level)
+    # Set log level from the input parameter 
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
 
+    logger.setLevel(args.log_level if args.log_level is not None else logging.INFO)
+    log_file_handler = logging.FileHandler(args.log_file, mode="w")
+    log_file_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(log_file_handler)
+    logger.propagate = False
+    logger.info("Logger initialized; writing to %s", args.log_file)
+
+    # Get the flux handle
     flux_handle = flux.Flux()
 
+    # Configure our simulated exec system and the user event simulator
     exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank, exclusive=args.exclusive)
     simulation = Simulation(
         flux_handle,
@@ -1122,52 +1328,97 @@ def main():
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
     )
+
+    # Take the system resource configuration and put it in the KVS 
+    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
+
+    #
+    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
+    # function paramater for every single module paramter 
+    reload_modules(flux_handle, queue_policy="easy", match_policy="first")
+
+    # Read in the job traces from the specified file and make a list of jobs
     reader = SacctReader(args.job_file, require_gpus=(args.gpus_per_rank and args.gpus_per_rank > 0))
     reader.validate_trace()
-    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
     jobs = list(reader.read_trace())
-
+    
     # Attach a traceable index to jobs for use in identifying jobs cross-run when their ID has changed
     for idx, job in enumerate(jobs):
         job.trace_index = idx  
 
+    # Set jobs as exclusive if applicable and insert the jobs start times into the event list in our user-event simulator    
     if args.exclusive:
         for job in jobs:
             job.set_exclusive(args.cores_per_rank, args.gpus_per_rank)
     for job in jobs:
         job.insert_apriori_events(simulation)
-    scheduler = 1
 
-    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
-    # function paramater for every single module paramter 
-    reload_modules(flux_handle, scheduler, queue_policy="easy", match_policy="lonode")
+    # Create progress bar tracking completed jobs
+    pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
+    simulation.progress = pbar
 
-    load_missing_modules(flux_handle )
+    # TODO: Should be checking to see if the jobtap plugin is loaded 
+    load_missing_modules(flux_handle)
+
+    # Configure RPC endpoints/watchers for our program
     watchers, services = setup_watchers(flux_handle, simulation)
+
+    # TODO: Remove everything related to journal consumer. This is junk 
     consumer = setup_journal(flux_handle, simulation)
+
+    # Register the exec system simulator as the exec system that we are using for Flux
     exec_hello(flux_handle)
+    
+    # __________________________
+    # --- SIMULATION PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+    # Begin the primary event loop of the user event simulator 
     simulation.advance()
 
+    # ________________________
+    # --- POST-SIM PHASE --- |
+    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾ 
+
+    # Run the last set of events in the reactor. If we arent able to, we encountered an exception in our simulation
     try:
         flux_handle.reactor_run(flux_handle.get_reactor(), 0)
     except Exception as e:
         logger.error(f"Reactor encountered an exception: {e}")
+
+    # Get rid of the watchers/services that we used in our simulation
     try:
         teardown_watchers(flux_handle, watchers, services)
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
+
+    if simulation.progress is not None:
+        simulation.progress.close()
+
+    # Print out the results of the simulation
     exec_validator.post_analysis(simulation)
+
+    # I had to put this delay previously because the eventlog wasn't done being updated 
+    # sometimes when we finished and we had to wait a few seconds for it to finish updating
+    # Probably a better method
     time.sleep(2)
+
+    # Dump Flux's own eventlog
     simulation.dump_eventlog()
 
-    dump_transitions_to_csv(simulation, "job_transitions.csv")
-    # print("Job Life Cycle Transitions:")
-    # for jobid, job in simulation.job_map.items():
-    #     print("Job {}:".format(jobid))
-    #     for state, timestamp in job.state_transitions.items():
-    #         print("  {} at time {}".format(state, timestamp))
+    # Dump out our own transition log to the file
+    dump_transitions_to_csv(simulation, "job_transitions.csv", flux_handle)
 
-    
+    # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
+    write_per_node_chrome_trace(simulation, "pernode.json", flux_handle)
+   
+    # Reset the emu-jobtap probe to defaults after a run
+    try:
+        flux_handle.rpc("job-manager.emu-jobtap.reset",
+                        payload={"keep_timestep": False}).get()
+        logger.debug("Reset emu-jobtap probe to defaults")
+    except Exception as e:
+        logger.error(f"Failed to reset emu-jobtap probe: {e}")
 
 
 if __name__ == "__main__":

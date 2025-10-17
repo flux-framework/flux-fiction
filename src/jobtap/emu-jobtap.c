@@ -52,12 +52,57 @@ static struct emulator *emulator_create(void) {
 static void emulator_destroy(struct emulator *emu) {
     if (!emu) return;
     int saved = errno;
+
     if (emu->sched_req) flux_future_destroy(emu->sched_req);
     if (emu->sim_req)   flux_msg_destroy(emu->sim_req);
-    free(emu);
-    errno = saved;
     if (emu->flush_req) flux_future_destroy(emu->flush_req);
     if (emu->buf_jobids) json_decref(emu->buf_jobids);
+
+    free(emu);
+    errno = saved;
+}
+
+// Function to reset the probe back to its original state
+static void emulator_reset(struct emulator *emu, bool keep_timestep)
+{
+    if (!emu) return;
+
+    // Cancel any outstanding request cleanly.
+    if (emu->sim_req) {
+        flux_respond_error(emu->h, emu->sim_req, ECANCELED,
+                           "emu-jobtap: reset while a probe was pending");
+        flux_msg_destroy(emu->sim_req);
+        emu->sim_req = NULL;
+    }
+    if (emu->sched_req) {
+        flux_future_destroy(emu->sched_req);
+        emu->sched_req = NULL;
+    }
+    if (emu->flush_req) {
+        flux_future_destroy(emu->flush_req);
+        emu->flush_req = NULL;
+    }
+    if (emu->buf_jobids) {
+        json_decref(emu->buf_jobids);
+        emu->buf_jobids = NULL;
+    }
+
+    // Wipe all counters and watermarks.
+    emu->tot_new = emu->tot_sched = emu->tot_alloc = emu->tot_start = emu->tot_inactive = 0ULL;
+    emu->wm_new  = emu->wm_sched  = emu->wm_alloc  = emu->wm_start  = emu->wm_inactive  = 0ULL;
+
+    // Clear expectations and runtime flags.
+    emu->exp_submits = 0ULL;
+    emu->exp_finishes = 0ULL;
+    emu->alloc_needed = 0ULL;
+    emu->probe_started = false;
+    emu->sched_quiescent_ok = false;
+
+    if (!keep_timestep)
+        emu->timestep = 0;
+
+    flux_log(emu->h, LOG_INFO, "emu-jobtap: probe state reset (keep_timestep=%d)",
+             keep_timestep ? 1 : 0);
 }
 
 static inline unsigned long long delta(unsigned long long total,
@@ -260,7 +305,8 @@ static void maybe_finish_after_quiescence(struct emulator *emu)
     }
 }
 
-static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
+static void sched_quiescent_continuation(flux_future_t *f, void *arg)
+{
     struct emulator *emu = arg;
     if (!emu) return;
 
@@ -270,7 +316,7 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
         return;
     }
 
-    const char *s = NULL;  
+    const char *s = NULL;
     if (flux_rpc_get(f, &s) < 0 || !s) {
         flux_log_error(emu->h, "sched.quiescent failed/unsupported: %s",
                        flux_future_error_string(f));
@@ -298,7 +344,40 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
                 alloc_current = (unsigned long long)json_integer_value(ja);
 
             emu->sched_quiescent_ok = (status == 0);
-            emu->alloc_needed = alloc_current;
+
+            // Number of jobs running at the last watermark
+            unsigned long long active_at_wm =
+                (emu->wm_start >= emu->wm_inactive)
+                    ? (emu->wm_start - emu->wm_inactive)
+                    : 0ULL;
+
+            // Number of jobs that finished since the last watermark
+            unsigned long long finishes_this_step =
+                (emu->tot_inactive >= emu->wm_inactive)
+                    ? (emu->tot_inactive - emu->wm_inactive)
+                    : 0ULL;
+
+            // Jobs still running now that were already active last step 
+            unsigned long long carryover =
+                (active_at_wm > finishes_this_step)
+                    ? (active_at_wm - finishes_this_step)
+                    : 0ULL;
+
+            // New allocations needed this step 
+            emu->alloc_needed =
+                (alloc_current > carryover)
+                    ? (alloc_current - carryover)
+                    : 0ULL;
+
+            flux_log(emu->h, LOG_DEBUG,
+                     "sched.quiescent: alloc_current=%llu active_at_wm=%llu finishes=%llu "
+                     "carryover=%llu alloc_needed=%llu",
+                     (unsigned long long)alloc_current,
+                     (unsigned long long)active_at_wm,
+                     (unsigned long long)finishes_this_step,
+                     (unsigned long long)carryover,
+                     (unsigned long long)emu->alloc_needed);
+
             try_flush_batched_starts(emu);
 
             flux_log(emu->h, LOG_DEBUG,
@@ -551,8 +630,35 @@ static void buffer_start_cb(flux_t *h, flux_msg_handler_t *mh,
     try_flush_batched_starts(emu);
 }
 
+static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
+                     const flux_msg_t *msg, void *arg)
+{
+    struct emulator *emu = arg;
+    (void)mh;
+    bool keep_timestep = false;
 
-/* plugin init */
+    // Optional JSON payload: {"keep_timestep": true|false}
+    const char *payload = NULL;
+    (void)flux_msg_get_string(msg, &payload);
+    if (payload && *payload) {
+        json_error_t jerr;
+        json_t *root = json_loads(payload, 0, &jerr);
+        if (root) {
+            json_t *kt = json_object_get(root, "keep_timestep");
+            if (kt && json_is_boolean(kt))
+                keep_timestep = json_boolean_value(kt);
+            json_decref(root);
+        } else {
+            // If payload is bad, just ignore and proceed with defaults.
+            flux_log(h, LOG_WARNING, "reset: bad JSON payload; using defaults");
+        }
+    }
+
+    emulator_reset(emu, keep_timestep);
+    flux_respond(h, msg, "{}");
+}
+
+// plugin init 
 
 int flux_plugin_init (flux_plugin_t *p)
 {
@@ -568,17 +674,17 @@ int flux_plugin_init (flux_plugin_t *p)
 
     flux_plugin_set_name(p, PLUGIN_NAME);
 
-    /* RPC service exposed to emulator */
+    // RPC service exposed to emulator 
     flux_jobtap_service_register(p, "quiescent", quiescent_cb, emu);
 
-    /* Register handlers (subscription happens inside cb_job_new) */
+    // Register handlers (subscription happens inside cb_job_new) 
     flux_plugin_add_handler(p, "job.new",            cb_job_new,            emu);
     flux_plugin_add_handler(p, "job.state.sched",    cb_job_state_sched,    emu);
     flux_plugin_add_handler(p, "job.event.alloc",    cb_job_event_alloc,    emu);
     flux_plugin_add_handler(p, "job.event.start",    cb_job_event_start,    emu);
     flux_plugin_add_handler(p, "job.state.inactive", cb_job_state_inactive, emu);
     flux_jobtap_service_register(p, "buffer-start", buffer_start_cb, emu);
-
+    flux_jobtap_service_register(p, "reset", reset_cb, emu);
 
     return 0;
 }
