@@ -57,12 +57,12 @@ def main():
     parser = argparse.ArgumentParser(description="Run flux-emulator multiple times and verify determinism.")
     parser.add_argument("--runs", type=int, default=10, help="Number of runs to perform (default: 10)")
     parser.add_argument("--cmd", type=str, required=False,
-                        default="python flux-emulator.py /home/j/Desktop/flux/sc25_poster/test-inputs/jobs_with_timelimit_decrement_2s.csv 100 16",
+                        default="python flux-emulator.py /home/j/Desktop/flux/sc25_poster/test-inputs/lassen_first_1000.csv 100 16",
                         help="Command to execute for each run (quote the whole command).")
     parser.add_argument("--workdir", type=str, default=".", help="Working directory to run the command in.")
     parser.add_argument("--output-csv", type=str, default="job_transitions.csv",
                         help="Path (relative to workdir) to the CSV the emulator produces.")
-    parser.add_argument("--correct-csv", type=str, default="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/job_transitions copy.csv",
+    parser.add_argument("--correct-csv", type=str, default="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/job_transitions_correct.csv",
                         help="Path to the baseline CSV to compare against.")
     parser.add_argument("--variations-dir", type=str, default="variations",
                         help="Directory to copy varied CSVs into.")
