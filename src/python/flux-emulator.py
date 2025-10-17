@@ -354,7 +354,7 @@ class Simulation(object):
 
         ct = qtime(job.complete_time)
         cb = make_tagged_cb("complete", job, lambda: self.complete_job(job), ct)
-        self.add_event(ct, cb)                   # completes get tagged now
+        self.add_event(ct, cb)                   
         self.step_expect[ct]["finishes"] += 1
 
     def complete_job(self, job):
@@ -415,7 +415,7 @@ class Simulation(object):
                 ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
                 return  
             else:
-                print(f"completes {self.num_complete} submits {self.num_submits}")
+                logger.info(f"completes {self.num_complete} submits {self.num_submits}")
                 logger.info("No more events in event list, running post-sim analysis")
                 self.post_verification()
                 logger.info("Ending simulation")
@@ -1392,6 +1392,9 @@ def main():
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
 
+    if simulation.progress is not None:
+        simulation.progress.close()
+
     # Print out the results of the simulation
     exec_validator.post_analysis(simulation)
 
@@ -1399,9 +1402,6 @@ def main():
     # sometimes when we finished and we had to wait a few seconds for it to finish updating
     # Probably a better method
     time.sleep(2)
-
-    if simulation.progress is not None:
-        simulation.progress.close()
 
     # Dump Flux's own eventlog
     simulation.dump_eventlog()
@@ -1411,6 +1411,14 @@ def main():
 
     # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
     write_per_node_chrome_trace(simulation, "pernode.json", flux_handle)
+   
+    # Reset the emu-jobtap probe to defaults after a run
+    try:
+        flux_handle.rpc("job-manager.emu-jobtap.reset",
+                        payload={"keep_timestep": False}).get()
+        logger.debug("Reset emu-jobtap probe to defaults")
+    except Exception as e:
+        logger.error(f"Failed to reset emu-jobtap probe: {e}")
 
 
 if __name__ == "__main__":

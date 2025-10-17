@@ -7,3 +7,4 @@ eventlog.csv
 /src/python/out
 /src/python/variations*
 /util/*.txt
+*.log
