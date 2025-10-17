@@ -24,6 +24,7 @@ from flux.resource import Rlist
 from flux.job import JournalConsumer
 import time
 from typing import List, Sequence, Union
+from tqdm import tqdm
 
 import os
 TIME_QUANTUM = 1e-6  
@@ -305,12 +306,14 @@ class Simulation(object):
             submit_job_hook=None,
             start_job_hook=None,
             complete_job_hook=None,
+            progress=None,
     ):
         self.event_list = event_list
         self.job_map = job_map
         self.current_time = 0
         self.flux_handle = flux_handle
         self.num_submits = 0
+        self.progress = progress
         self.num_complete = 0
         self.pending_inactivations = set()
         self.job_manager_quiescent = True
@@ -354,9 +357,6 @@ class Simulation(object):
         self.add_event(ct, cb)                   # completes get tagged now
         self.step_expect[ct]["finishes"] += 1
 
-
-
-
     def complete_job(self, job):
         '''
         This is used to trigger the finish and release events for a job when the time to complete it is reached
@@ -370,6 +370,9 @@ class Simulation(object):
         if self.complete_job_hook:
             self.complete_job_hook(self, job)
         job.complete(self.flux_handle)
+        # Update tqdm progress bar
+        if self.progress is not None:
+            self.progress.update(1)
         logger.info("Completed job {}".format(job.jobid))
 
 
@@ -1290,7 +1293,8 @@ def main():
 
     # Specifies log level for Flux
     # TODO: Logging isnt currently working. It could be because Im just not specifying a log level when i run the program. There is no default
-    parser.add_argument("--log-level", type=int)
+    parser.add_argument("--log-level", type=int, help="Python logger level")
+    parser.add_argument("--log-file", default="emulator.log", help="Write logs to this file (default: emulator.log)")
 
     # Flag to specify whether nodes will be counted as exclusive or not
     # (you only have to say the job needs 1 node and the program assumes you want all the cores and gpus in a node)
@@ -1298,8 +1302,18 @@ def main():
     args = parser.parse_args()
 
     # Set log level from the input parameter 
-    if args.log_level:
-        logger.setLevel(args.log_level)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    logger.setLevel(args.log_level if args.log_level is not None else logging.INFO)
+    log_file_handler = logging.FileHandler(args.log_file, mode="w")
+    log_file_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(log_file_handler)
+    logger.propagate = False
+    logger.info("Logger initialized; writing to %s", args.log_file)
 
     # Get the flux handle
     flux_handle = flux.Flux()
@@ -1321,7 +1335,7 @@ def main():
     #
     # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
     # function paramater for every single module paramter 
-    reload_modules(flux_handle, queue_policy="conservative", match_policy="first")
+    reload_modules(flux_handle, queue_policy="easy", match_policy="first")
 
     # Read in the job traces from the specified file and make a list of jobs
     reader = SacctReader(args.job_file, require_gpus=(args.gpus_per_rank and args.gpus_per_rank > 0))
@@ -1338,6 +1352,10 @@ def main():
             job.set_exclusive(args.cores_per_rank, args.gpus_per_rank)
     for job in jobs:
         job.insert_apriori_events(simulation)
+
+    # Create progress bar tracking completed jobs
+    pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
+    simulation.progress = pbar
 
     # TODO: Should be checking to see if the jobtap plugin is loaded 
     load_missing_modules(flux_handle)
@@ -1382,12 +1400,18 @@ def main():
     # Probably a better method
     time.sleep(2)
 
+    if simulation.progress is not None:
+        simulation.progress.close()
+
     # Dump Flux's own eventlog
     simulation.dump_eventlog()
 
     # Dump out our own transition log to the file
     dump_transitions_to_csv(simulation, "job_transitions.csv", flux_handle)
+
+    # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
     write_per_node_chrome_trace(simulation, "pernode.json", flux_handle)
+
 
 if __name__ == "__main__":
     main()
