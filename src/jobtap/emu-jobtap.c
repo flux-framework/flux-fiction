@@ -260,7 +260,8 @@ static void maybe_finish_after_quiescence(struct emulator *emu)
     }
 }
 
-static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
+static void sched_quiescent_continuation(flux_future_t *f, void *arg)
+{
     struct emulator *emu = arg;
     if (!emu) return;
 
@@ -270,7 +271,7 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
         return;
     }
 
-    const char *s = NULL;  
+    const char *s = NULL;
     if (flux_rpc_get(f, &s) < 0 || !s) {
         flux_log_error(emu->h, "sched.quiescent failed/unsupported: %s",
                        flux_future_error_string(f));
@@ -298,7 +299,40 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg) {
                 alloc_current = (unsigned long long)json_integer_value(ja);
 
             emu->sched_quiescent_ok = (status == 0);
-            emu->alloc_needed = alloc_current;
+
+            // Number of jobs running at the last watermark
+            unsigned long long active_at_wm =
+                (emu->wm_start >= emu->wm_inactive)
+                    ? (emu->wm_start - emu->wm_inactive)
+                    : 0ULL;
+
+            // Number of jobs that finished since the last watermark
+            unsigned long long finishes_this_step =
+                (emu->tot_inactive >= emu->wm_inactive)
+                    ? (emu->tot_inactive - emu->wm_inactive)
+                    : 0ULL;
+
+            // Jobs still running now that were already active last step 
+            unsigned long long carryover =
+                (active_at_wm > finishes_this_step)
+                    ? (active_at_wm - finishes_this_step)
+                    : 0ULL;
+
+            // New allocations needed this step 
+            emu->alloc_needed =
+                (alloc_current > carryover)
+                    ? (alloc_current - carryover)
+                    : 0ULL;
+
+            flux_log(emu->h, LOG_DEBUG,
+                     "sched.quiescent: alloc_current=%llu active_at_wm=%llu finishes=%llu "
+                     "carryover=%llu alloc_needed=%llu",
+                     (unsigned long long)alloc_current,
+                     (unsigned long long)active_at_wm,
+                     (unsigned long long)finishes_this_step,
+                     (unsigned long long)carryover,
+                     (unsigned long long)emu->alloc_needed);
+
             try_flush_batched_starts(emu);
 
             flux_log(emu->h, LOG_DEBUG,
