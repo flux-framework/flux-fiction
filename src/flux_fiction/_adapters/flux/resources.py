@@ -72,8 +72,8 @@ def insert_resource_data(flux_handle, num_ranks, cores_per_rank,
         if out is not None:
             rlist_json = out
 
-    # NOW debug-print the final thing
-    print("FINAL resource.R going to KVS:\n%s",
+    # debug-print the final thing
+    logger.debug("FINAL resource.R going to KVS:\n%s",
                  json.dumps(rlist_json, indent=2, sort_keys=True))
 
 
@@ -87,7 +87,7 @@ def insert_resource_data(flux_handle, num_ranks, cores_per_rank,
     if commit_rc is not None:
         raise ValueError(f"Error committing resource data to KVS, rc={commit_rc}")
     
-    print("Rlist ENCODE():", rlist.encode())
+    logger.debug("Rlist ENCODE(): %s", rlist.encode())
 
 def insert_resource_R_from_json(flux_handle, rjson_path: str):
     """

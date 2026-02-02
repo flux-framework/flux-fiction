@@ -4,6 +4,9 @@ import argparse
 
 from flux_fiction.api import client
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -23,6 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file",        type=str, default=None, help="Write logs to this file; default stdout.")
 
     parser.add_argument("--exclusive", action="store_true", help="Each job consumes all resources on its nodes.")
+    parser.add_argument("--quiet",     action="store_true", help="Turn off console logs")
+
 
     return parser
 
@@ -34,10 +39,10 @@ def main() -> int:
     result = client.run_experiment(args)
 
     if not result.ok:
-        print(f"Run failed: {result.message}")
+        logger.critical(f"Run failed: {result.message}")
         return 1
 
-    print(result.message)
+    logger.info(result.message)
     return 0
 
 

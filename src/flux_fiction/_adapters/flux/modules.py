@@ -41,7 +41,7 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
     # Acquire the path to the scheduling module being used
     # Additionally, acquire the path to the resource module
     for module in get_loaded_modules(flux_handle):
-        print(module)
+        logger.debug(module)
         if "sched-simple" in module["services"]:
             sched_module = module["name"]
             path = module["path"]
@@ -56,9 +56,9 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
             feasibility_module_path = module["path"]
 
     if path:
-        print(f"{path}")
+        logger.debug(f"{path}")
     elif fluxion_qmanager_path:
-        print(fluxion_qmanager_path)
+        logger.debug(f"fluxion_qmanager_path: {fluxion_qmanager_path}")
     logger.debug(
         "Reloading the '{}' and 'resource' module".format(sched_module))
     if  resource_module_path is not None:

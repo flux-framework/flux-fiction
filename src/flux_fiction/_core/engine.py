@@ -122,12 +122,15 @@ def run(config) -> EngineResult:
         flux_handle.reactor_run(flux_handle.get_reactor(), 0)
     except Exception as e:
         logger.error(f"Reactor encountered an exception: {e}")
+        return EngineResult(ok=False, message="Error during simulation time")
+
 
     # Get rid of the watchers/services that we used in our simulation
     try:
         flux_watchers.teardown_watchers(flux_handle, watchers, services)
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
+        return EngineResult(ok=False, message="Error tearing down watchers")
 
     if simulation.progress is not None:
         simulation.progress.close()
@@ -143,7 +146,7 @@ def run(config) -> EngineResult:
     config = f"nodes{config.nnodes}_cpr{config.ncpus}" 
     kvs_outfile = f"kvs_growth_{config}.csv"
     simulation.dump_kvs_timeseries(kvs_outfile)
-    print(f"Wrote KVS time series to {kvs_outfile}")
+    logger.info(f"Wrote KVS time series to {kvs_outfile}")
 
     # Dump Flux's own eventlog
     simulation.dump_eventlog()
@@ -191,8 +194,9 @@ def run(config) -> EngineResult:
         logger.debug("Reset emu-jobtap probe to defaults")
     except Exception as e:
         logger.error(f"Failed to reset emu-jobtap probe: {e}")
+        return EngineResult(ok=False, message="Failed to reset emu-jobtap probe")
 
-    return EngineResult(ok=True, message="Ran (stub)")
+    return EngineResult(ok=True, message="Ran Successfully")
 
 _EVENT_LOG_FILE = "event_order_log.csv"
 _EVENT_LOG_HEADER_WRITTEN = False

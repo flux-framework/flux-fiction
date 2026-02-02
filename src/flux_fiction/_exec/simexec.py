@@ -102,7 +102,7 @@ class SimpleExec(object):
                 (self.used_core_hours / total_core_hours) * 100.0
             ))
         else:
-            print("ERROR: Total core hours is 0. Simulation likely didn't run or no jobs were submitted.")
+            logger.error("Total core hours is 0. Simulation likely didn't run or no jobs were submitted.")
 
         # GPU stats (only if GPUs are configured)
         if self.gpus_per_node:
@@ -114,4 +114,4 @@ class SimpleExec(object):
                     (self.used_gpu_hours / total_gpu_hours) * 100.0
                 ))
             else:
-                print("ERROR: Total GPU hours is 0. (GPUs configured but zero makespan?)")
+                logger.error("Total GPU hours is 0. (GPUs configured but zero makespan?)")
