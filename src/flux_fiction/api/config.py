@@ -23,6 +23,14 @@ class ExperimentConfig:
 
 
 def validate_config(cfg: ExperimentConfig) -> None:
+    '''
+    Docstring for validate_config
+    
+    :param cfg: Takes in a ExperimentConfig object and validates if the configuration settings make sense
+    :type cfg: ExperimentConfig
+
+    Used to determine if the Flux Fiction configuration is valid or not.
+    '''
     if cfg.resource_file and cfg.resource_R:
         raise ValueError("Use only one of --resource_file or --resource_R.")
     if cfg.nnodes < 0 or cfg.nsockets < 1 or cfg.ncpus < 1 or cfg.ngpus < 0:
@@ -35,6 +43,15 @@ def from_toml(args: dict) -> ExperimentConfig:
     pass
 
 def from_cli_args(args) -> ExperimentConfig:
+    '''
+    Docstring for from_cli_args
+    
+    :param args: parsed command line arguments given to Flux Fiction
+    :return: Returns an ExperimentConfig object containing the full configuration being used for the Flux Fiction run
+    :rtype: ExperimentConfig
+
+    This function is used as a loader to take a set of command line arguments and turn it into a configuration for a run of Flux Fiction
+    '''
     if args.config_file is None:
         cfg = ExperimentConfig(
             job_traces=args.job_traces,

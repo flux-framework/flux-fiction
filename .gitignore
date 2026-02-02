@@ -9,3 +9,5 @@ eventlog.csv
 /util/*.txt
 *.log
 *__pycache__/
+src/*.csv
+src/*.json
