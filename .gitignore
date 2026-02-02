@@ -8,3 +8,4 @@ eventlog.csv
 /src/python/variations*
 /util/*.txt
 *.log
+*__pycache__/

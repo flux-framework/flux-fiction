@@ -1,0 +1,39 @@
+Makespan (hours): 899.8
+Total Core-Hours: 28,504,907.2
+Used Core-Hours: 381,968.9
+Average Core-Utilization: 1.34%
+
+{
+ "object_count": 76210,
+ "dbfile_size": 73318400,
+ "dbfile_free": 738057142272,
+ "load_time": {
+  "count": 15947,
+  "min": 0.00084000000000000003,
+  "max": 0.066221000000000002,
+  "mean": 0.0023071904433435574,
+  "stddev": 0.0026657833573792262
+ },
+ "store_time": {
+  "count": 76276,
+  "min": 0.0032499999999999999,
+  "max": 2.4844659999999998,
+  "mean": 0.020440025433950397,
+  "stddev": 0.033275322252570176
+ },
+ "config": {
+  "journal_mode": "OFF",
+  "synchronous": "OFF"
+ },
+ "checkpoints": [
+  {
+   "id": 1,
+   "value": {
+    "version": 1,
+    "rootref": "sha1-479ab51be6de43b44cb70d7a5bb5563fe0db9f05",
+    "sequence": 1,
+    "timestamp": 1761576909.9386673
+   }
+  }
+ ]
+}

@@ -122,27 +122,55 @@ class Job(object):
         if self._jobspec is not None:
             return self._jobspec
 
-        withs = []
+        # ------------------------------------------------------------
+        # Build resources under the slot. If your R is node->socket->core
+        # (and maybe gpu), the jobspec should include a socket layer too.
+        # ------------------------------------------------------------
+
         if self.exclusive:
             # request full node capacity
-            core = create_resource("core", int(self.cores_per_node))
-            withs.append(core)
+            if self.cores_per_node is None:
+                raise ValueError("exclusive=True but cores_per_node is not set")
+            total_cores = int(self.cores_per_node)
+
+            total_gpus = 0
             if self.gpus_per_node:
-                gpu = create_resource("gpu", int(self.gpus_per_node))
-                withs.append(gpu)
+                total_gpus = int(self.gpus_per_node)
         else:
             assert self.ncpus % self.nnodes == 0
-            core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
-            withs.append(core)
+            total_cores = math.ceil(self.ncpus / self.nnodes)
+
+            total_gpus = 0
             if self.ngpus:
                 if self.ngpus % self.nnodes != 0:
-                    logger.warning("NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
-                                .format(self.ngpus, self.nnodes))
-                gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
-                withs.append(gpu)
+                    logger.warning(
+                        "NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
+                        .format(self.ngpus, self.nnodes)
+                    )
+                total_gpus = math.ceil(self.ngpus / self.nnodes)
 
-        slot = create_slot("task", 1, withs)
+        # Match your tiny JGF assumption: 2 sockets per node.
+        # (Make this configurable later if you want.)
+        sockets_per_node = 2
+
+        # Distribute per-node requirements across sockets so we don't under-request.
+        cores_per_socket = math.ceil(total_cores / sockets_per_node)
+        gpus_per_socket  = math.ceil(total_gpus / sockets_per_node) if total_gpus else 0
+
+        # What each socket should contain
+        socket_with = [create_resource("core", int(cores_per_socket))]
+        if gpus_per_socket:
+            socket_with.append(create_resource("gpu", int(gpus_per_socket)))
+
+        # Add the socket layer (THIS is the key change)
+        socket = create_resource("socket", int(sockets_per_node), socket_with)
+
+        # Slot now contains sockets, not cores directly
+        slot = create_slot("task", 1, [socket])
+
+        # Node section unchanged
         resource_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
+
         jobspec = {
             "version": 1,
             "resources": [resource_section],
@@ -153,8 +181,48 @@ class Job(object):
             }],
             "attributes": {"system": {"duration": self.timelimit}},
         }
+
         self._jobspec = jobspec
         return self._jobspec
+    
+    # @property
+    # def jobspec(self):
+    #     if self._jobspec is not None:
+    #         return self._jobspec
+
+    #     withs = []
+    #     if self.exclusive:
+    #         # request full node capacity
+    #         core = create_resource("core", int(self.cores_per_node))
+    #         withs.append(core)
+    #         if self.gpus_per_node:
+    #             gpu = create_resource("gpu", int(self.gpus_per_node))
+    #             withs.append(gpu)
+    #     else:
+    #         assert self.ncpus % self.nnodes == 0
+    #         core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
+    #         withs.append(core)
+    #         if self.ngpus:
+    #             if self.ngpus % self.nnodes != 0:
+    #                 logger.warning("NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
+    #                             .format(self.ngpus, self.nnodes))
+    #             gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
+    #             withs.append(gpu)
+
+    #     slot = create_slot("task", 1, withs)
+    #     resource_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
+    #     jobspec = {
+    #         "version": 1,
+    #         "resources": [resource_section],
+    #         "tasks": [{
+    #             "command": ["command", "200"],
+    #             "slot": "task",
+    #             "count": {"per_slot": 1},
+    #         }],
+    #         "attributes": {"system": {"duration": self.timelimit}},
+    #     }
+    #     self._jobspec = jobspec
+    #     return self._jobspec
 
 
     def set_exclusive(self, cores_per_node, gpus_per_node=0):
@@ -291,6 +359,13 @@ class EventList(six.Iterator):
         except (IndexError, KeyError):
             raise StopIteration()
 
+def queue_wait_time(job) -> float:
+    """Sim-time queue wait: STARTED - SUBMITTED (no runtime)."""
+    sub = job.state_transitions.get("SUBMITTED", None)
+    sta = job.state_transitions.get("STARTED", None)
+    if sub in (None, "") or sta in (None, ""):
+        return 0.0
+    return max(0.0, float(sta) - float(sub))
 
 class Simulation(object):
     '''
@@ -324,6 +399,40 @@ class Simulation(object):
         self.step_expect = defaultdict(lambda: {"submits": 0, "finishes": 0})
         self.time_step = 0
         self.pending_start_msgs = {} 
+        self.queue_wait = None
+        self.kvs_samples = []          
+        self.kvs_sample_every = 1      
+        self.kvs_module_name = "content-sqlite"
+
+    def sample_kvs_stats(self):
+        """
+        Record a KVS stat snapshot at current sim time.
+        Stores: time, dbfile_size, object_count (if available)
+        """
+        try:
+            st = get_module_stats_anyhow(self.flux_handle, self.kvs_module_name)
+            self.kvs_samples.append({
+                "time": float(self.current_time),
+                "dbfile_size": int(st.get("dbfile_size", 0)),
+                "object_count": int(st.get("object_count", 0)),
+            })
+        except Exception as e:
+            # Don't crash the sim for metrics
+            logger.warning("KVS sample failed at time=%s: %s", self.current_time, e)
+            self.kvs_samples.append({
+                "time": float(self.current_time),
+                "dbfile_size": "",
+                "object_count": "",
+            })
+
+    def dump_kvs_timeseries(self, out_path: str):
+        fieldnames = ["time", "dbfile_size", "object_count"]
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in self.kvs_samples:
+                w.writerow(row)
+
 
     def add_event(self, time, callback):
         '''
@@ -334,6 +443,7 @@ class Simulation(object):
         self.event_list.add_event(time, callback)
 
 
+    
     def submit_job(self, job):
         self.num_submits += 1
         job.record_state_transition("SUBMITTED", qtime(self.current_time))  
@@ -347,6 +457,7 @@ class Simulation(object):
     def start_job(self, jobid, start_msg):
         job = self.job_map[jobid]
         job.record_state_transition("STARTED", qtime(self.current_time))
+        job.queue_wait = queue_wait_time(job)
         job.real_start = time.time()
         if self.start_job_hook:
             self.start_job_hook(self, job)
@@ -447,9 +558,13 @@ class Simulation(object):
         for cb in events_at_time:
             cb()
 
+        # KVS sampling (time series)
+        if self.kvs_sample_every and (self.time_step % self.kvs_sample_every == 0):
+            self.sample_kvs_stats()
+
         if self.time_step == 0:
             time.sleep(0.5)
-            self.time_step+=1
+        self.time_step+=1
 
         # build expect and probe (no second execution loop!)
         expect = self.step_expect.get(self.current_time, {"submits": 0, "finishes": 0})
@@ -678,9 +793,55 @@ class SacctReader(JobTraceReader):
             jobs = [job_from_slurm_row(row) for row in reader]
         return jobs
 
+def attach_scheduling_graph(rlist_json: dict, scheduling: dict) -> dict:
+    """
+    Mirror cmd_parse_config(): rl->scheduling = sched_json
+    No conversion, no wrapping (unless you choose to).
+    """
+    if not isinstance(rlist_json, dict):
+        raise TypeError("rlist_json must be a dict")
+    if not isinstance(scheduling, dict):
+        raise TypeError("scheduling must be a dict (parsed JSON object)")
+    rlist_json["scheduling"] = scheduling
+    return rlist_json
+
+
+def load_json_file(path: str) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def insert_resource_R_from_json(flux_handle, rjson_path: str):
+    """
+    Load a complete RFC20 / RV1 resource description from JSON
+    and install it into KVS as resource.R.
+
+    This mirrors the C path:
+      json_load_file -> rlist_from_json -> rlist_puts
+    except we already trust the JSON is valid.
+    """
+    if not os.path.exists(rjson_path):
+        raise FileNotFoundError(f"Resource JSON file not found: {rjson_path}")
+
+    with open(rjson_path, "r") as f:
+        rjson = json.load(f)
+
+    if not isinstance(rjson, dict):
+        raise ValueError("resource.R JSON must be a JSON object")
+
+    logger.info("Loading full resource.R from %s", rjson_path)
+
+    # Put directly into KVS
+    rc = flux.kvs.put(flux_handle, "resource.R", rjson)
+    if rc is not None:
+        raise RuntimeError(f"flux.kvs.put(resource.R) failed, rc={rc}")
+
+    rc = flux.kvs.commit(flux_handle)
+    if rc is not None:
+        raise RuntimeError(f"flux.kvs.commit() failed, rc={rc}")
 
 def insert_resource_data(flux_handle, num_ranks, cores_per_rank,
-                         hostname_pattern="node{rank}", gpus_per_rank=0):
+                         hostname_pattern="node{rank}", gpus_per_rank=0,
+                         scheduling_path=None, scheduling_obj=None):
     """
     Build R using Rlist.add_rank(...) for cores, then add GPU children per rank
     with rlist.add_child(rank, "gpu", "<idset>"). Debug-print the final JSON
@@ -701,19 +862,36 @@ def insert_resource_data(flux_handle, num_ranks, cores_per_rank,
         # If GPUs enabled, append a gpu child ID set to this rank
         if gpus_per_rank and gpus_per_rank > 0:
             gpu_range = f"0-{gpus_per_rank - 1}" if gpus_per_rank > 1 else "0"
-            # This attaches {"gpu": "0-(gpus_per_rank-1)"} at this rank
             rlist.add_child(rank, "gpu", gpu_range)
 
-    # Encode to the canonical R JSON string and pretty-print for debug
+    # Encode to the R JSON string
     rlist_str = rlist.encode()
     try:
         rlist_json = json.loads(rlist_str)
     except Exception:
-        # Fallback if encode() isn't pure JSON (should be)
         rlist_json = {"RAW_R": rlist_str}
 
     logger.debug("resource.R going to KVS:\n%s",
                  json.dumps(rlist_json, indent=2, sort_keys=True))
+
+    # Attach scheduling JSON
+    if scheduling_path and scheduling_obj:
+        raise ValueError("Use only one of scheduling_path or scheduling_obj")
+
+    if scheduling_path:
+        sched = load_json_file(scheduling_path)
+        out = attach_scheduling_graph(rlist_json, sched)
+        if out is not None:
+            rlist_json = out
+    elif scheduling_obj:
+        out = attach_scheduling_graph(rlist_json, scheduling_obj)
+        if out is not None:
+            rlist_json = out
+
+    # NOW debug-print the final thing
+    print("FINAL resource.R going to KVS:\n%s",
+                 json.dumps(rlist_json, indent=2, sort_keys=True))
+
 
     # Put into KVS and commit
     kvs_key = "resource.R"
@@ -780,6 +958,8 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
             fluxion_resource_path = module["path"]
         elif "resource" in module["name"]:
             resource_module_path = module["path"]
+        elif "feasibility" in module["name"]:
+            feasibility_module_path = module["path"]
 
     if path:
         print(f"{path}")
@@ -795,6 +975,8 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
             else:
                 flux_handle.rpc("module.remove", payload={
                                 "name": "sched-fluxion-qmanager"}).get()
+                flux_handle.rpc("module.remove", payload={
+                                "name": "sched-fluxion-feasibility"}).get()
                 flux_handle.rpc("module.remove", payload={
                                 "name": "sched-fluxion-resource"}).get()
             flux_handle.rpc("module.remove", payload={
@@ -817,6 +999,8 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
                 flux_handle.rpc("module.load", payload={
                                 "path": fluxion_resource_path, "args": [f"match-policy={match_policy}"]}).get()
                 # "queue-policy=conservative"
+                flux_handle.rpc("module.load", payload={
+                                "path": feasibility_module_path, "args": []}).get()
                 flux_handle.rpc("module.load", payload={
                                 "path": fluxion_qmanager_path, "args": [f"queue-policy={queue_policy}"]}).get()
 
@@ -1265,8 +1449,25 @@ def write_per_node_chrome_trace(simulation, out_path="pernode_trace.json", flux_
     with open(out_path, "w") as f:
         json.dump(trace_obj, f)
 
+import subprocess
+def get_module_stats_anyhow(flux_handle, module_name: str) -> dict:
+    """
+    Best-effort way to get `flux module stats <name>` as a dict.
+    Tries RPC first; falls back to calling the `flux` CLI.
+    """
+    # # 1) RPC attempt (works on many builds)
+    # try:
+    #     return flux_handle.rpc("module.stats", payload={"name": module_name}).get()
+    # except Exception:
+    #     print("didnt work")
+    
+    out = subprocess.check_output(["flux", "module", "stats", module_name], text=True)
+    return json.loads(out)
 
-
+def get_content_sqlite_dbfile_size(flux_handle) -> int:
+    st = get_module_stats_anyhow(flux_handle, "content-sqlite")
+    # your example shows dbfile_size at the top-level
+    return int(st.get("dbfile_size", 0))
 
 @flux.util.CLIMain(logger)
 def main():
@@ -1317,6 +1518,7 @@ def main():
 
     # Get the flux handle
     flux_handle = flux.Flux()
+    kvs_size_start = get_content_sqlite_dbfile_size(flux_handle)
 
     # Configure our simulated exec system and the user event simulator
     exec_validator = SimpleExec(args.num_ranks, args.cores_per_rank, gpus_per_node=args.gpus_per_rank, exclusive=args.exclusive)
@@ -1330,17 +1532,24 @@ def main():
     )
 
     # Take the system resource configuration and put it in the KVS 
-    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
+    # insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
+    insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank, scheduling_path="/home/j/Desktop/flux/flux-sched/t/data/resource/jgfs/tiny.json")
 
+    
+    # insert_resource_R_from_json(flux_handle, rjson_path="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/tuolumne.json")
     #
     # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
     # function paramater for every single module paramter 
-    reload_modules(flux_handle, queue_policy="easy", match_policy="first")
+    reload_modules(flux_handle, queue_policy="conservative", match_policy="first")
 
+    
     # Read in the job traces from the specified file and make a list of jobs
     reader = SacctReader(args.job_file, require_gpus=(args.gpus_per_rank and args.gpus_per_rank > 0))
+    
     reader.validate_trace()
     jobs = list(reader.read_trace())
+    
+
     
     # Attach a traceable index to jobs for use in identifying jobs cross-run when their ID has changed
     for idx, job in enumerate(jobs):
@@ -1372,7 +1581,7 @@ def main():
     # __________________________
     # --- SIMULATION PHASE --- |
     # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
-
+ 
     # Begin the primary event loop of the user event simulator 
     simulation.advance()
 
@@ -1403,6 +1612,11 @@ def main():
     # Probably a better method
     time.sleep(2)
 
+    config = f"nodes{args.num_ranks}_cpr{args.cores_per_rank}" 
+    kvs_outfile = f"kvs_growth_{config}.csv"
+    simulation.dump_kvs_timeseries(kvs_outfile)
+    print(f"Wrote KVS time series to {kvs_outfile}")
+
     # Dump Flux's own eventlog
     simulation.dump_eventlog()
 
@@ -1411,6 +1625,36 @@ def main():
 
     # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
     write_per_node_chrome_trace(simulation, "pernode.json", flux_handle)
+
+    kvs_size_end = get_content_sqlite_dbfile_size(flux_handle)
+    completed = max(1, simulation.num_complete)  
+
+    kvs_bytes_per_completed = (kvs_size_end - kvs_size_start) / float(completed)
+
+    makespan = max(1e-9, float(exec_validator.makespan.end - exec_validator.makespan.beginning))
+    kvs_growth_bytes_per_sim_s = (kvs_size_end - kvs_size_start) / makespan
+
+    print(f"KVS content-sqlite dbfile_size start: {kvs_size_start} bytes")
+    print(f"KVS content-sqlite dbfile_size end:   {kvs_size_end} bytes")
+    print(f"KVS bytes per completed job:          {kvs_bytes_per_completed:.2f} bytes/job")
+    print(f"KVS growth rate:                      {kvs_growth_bytes_per_sim_s:.2f} bytes/s (sim time)")
+
+    # Average queue wait (sim-time) across jobs that actually started
+    waits = []
+    for job in simulation.job_map.values():
+        # queue_wait is set in Simulation.start_job(); ignore jobs that never started
+        if job.queue_wait is not None:
+            waits.append(float(job.queue_wait))
+
+    if waits:
+        avg_wait = sum(waits) / len(waits)
+        print(f"Average queue wait time: {avg_wait:.6f} seconds (sim time) over {len(waits)} jobs")
+    else:
+        print("Average queue wait time: N/A (no jobs have queue_wait recorded)")
+
+    if waits:
+        print(f"Max queue wait time: {max(waits):.6f} seconds (sim time)")
+
    
     # Reset the emu-jobtap probe to defaults after a run
     try:
