@@ -2,34 +2,43 @@ import logging
 logger = logging.getLogger(__name__)
 import flux
 
-def sim_exec_start_cb(flux_handle, watcher, msg, simulation):
-    payload = msg.payload
-    jobid = payload["id"]
+def sim_exec_start_cb(flux_handle, watcher, msg, args=None):
+    logger.debug("sim_exec_start_cb called")
+    try:
+        ctx = watcher.exec_ctx
+        payload = msg.payload
+        jobid = payload["id"]
 
-    # Buffer the raw start request so we can ack it later in a batch
-    simulation.pending_start_msgs[jobid] = msg
+        ctx["pending_start_msgs"][jobid] = msg
 
-    # Tell jobtap we've received this start (async; no blocking inside watcher)
-    flux_handle.rpc(
-        "job-manager.emu-jobtap.buffer-start",
-        payload={"jobid": jobid}
-    ).then(lambda fut, arg: None, arg=None)
-    
+        flux_handle.rpc(
+            "job-manager.emu-jobtap.buffer-start",
+            payload={"jobid": jobid}
+        ).then(lambda fut, arg: None, arg=None)
+    except Exception as e:
+        logger.debug(f"Error starting the job: {e}")
 
-def sim_exec_flush_starts_cb(flux_handle, watcher, msg, simulation):
-    body = msg.payload or {}
-    jobids = body.get("jobids", [])
 
-    for jobid in jobids:
-        start_msg = simulation.pending_start_msgs.pop(jobid, None)
-        if start_msg is None:
-            logger.error("flush-starts: unknown jobid %s", jobid)
-            continue
-        # Now we actually "start" the job (records start time, schedules complete, sends ACK)
-        simulation.start_job(jobid, start_msg)
+def sim_exec_flush_starts_cb(flux_handle, watcher, msg, args=None):
 
-    # reply to jobtap so it knows we accepted the flush
-    flux_handle.respond(msg, payload={"ok": True})
+    logger.debug("sim_exec_flush_starts_cb called")
+
+    try: 
+        ctx = watcher.exec_ctx
+        body = msg.payload or {}
+        jobids = body.get("jobids", [])
+
+        for jobid in jobids:
+            start_msg = ctx["pending_start_msgs"].pop(jobid, None)
+            if start_msg is None:
+                logger.error("flush-starts: unknown jobid %s", jobid)
+                continue
+
+            ctx["start_job"](jobid, start_msg)
+
+        flux_handle.respond(msg, payload={"ok": True})
+    except Exception as e:
+        logger.debug(f"Error starting the job: {e}")
 
 
 
@@ -51,7 +60,7 @@ def service_remove(f, name):
     future = f.service_unregister(name)
     return f.future_get(future, None)
 
-def setup_watchers(flux_handle, simulation):
+def setup_watchers(flux_handle, start_job_cb):
     '''
     Adds all appropriate watchers to the emulator
 
@@ -59,18 +68,20 @@ def setup_watchers(flux_handle, simulation):
     '''
     watchers = []
     services = set()
-    for type_mask, topic, cb, args in [
-        (
-            flux.constants.FLUX_MSGTYPE_REQUEST,
-            "sim-exec.start",
-            sim_exec_start_cb,
-            simulation,
-        ),
-        (flux.constants.FLUX_MSGTYPE_REQUEST, "sim-exec.flush-starts",  sim_exec_flush_starts_cb, simulation),
+    pending_start_msgs = {}
+    exec_ctx = {
+        "pending_start_msgs": pending_start_msgs,
+        "start_job": start_job_cb,
+    }
+
+    for type_mask, topic, cb in [
+        (flux.constants.FLUX_MSGTYPE_REQUEST, "sim-exec.start", sim_exec_start_cb),
+        (flux.constants.FLUX_MSGTYPE_REQUEST, "sim-exec.flush-starts",  sim_exec_flush_starts_cb),
     ]:
         watcher = flux_handle.msg_watcher_create(
-            cb, type_mask=type_mask, topic_glob=topic, args=args
+            cb, type_mask=type_mask, topic_glob=topic
         )
+        watcher.exec_ctx = exec_ctx
         watcher.start()
         watchers.append(watcher)
         if type_mask == flux.constants.FLUX_MSGTYPE_REQUEST:

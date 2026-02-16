@@ -25,9 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level",       type=int, default=10, help="Python logger level.")
     parser.add_argument("--log-file",        type=str, default=None, help="Write logs to this file; default stdout.")
 
-    parser.add_argument("--exclusive", action="store_true", help="Each job consumes all resources on its nodes.")
-    parser.add_argument("--quiet",     action="store_true", help="Turn off console logs")
+    parser.add_argument("--exclusive",       action="store_true", help="Each job consumes all resources on its nodes.")
+    parser.add_argument("--quiet",           action="store_true", help="Turn off console logs")
 
+    parser.add_argument("--backend",         type=str, default="flux", help="Determines what backend to use for job management. Currently, only Flux and Mock are supported as this is mainly for unit testing.")
 
     return parser
 

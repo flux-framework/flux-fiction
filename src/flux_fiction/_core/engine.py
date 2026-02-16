@@ -5,11 +5,8 @@ from __future__ import annotations
 import flux_fiction._core.errors as errors
 import flux_fiction._core.models as models
 import flux_fiction._core.events as events
-import flux_fiction._adapters.flux.stats as flux_stats
-import flux_fiction._adapters.flux.modules as flux_modules
-import flux_fiction._adapters.flux.resources as flux_resources
-import flux_fiction._adapters.flux.watchers as flux_watchers
-import flux_fiction._adapters.flux.journal as flux_journal
+
+from flux_fiction._adapters.base import Adapter 
 import flux_fiction._outputs.filesystem_output as filesystem_output
 
 from flux_fiction._exec.simexec import SimpleExec  
@@ -19,7 +16,7 @@ import logging
 from collections import defaultdict
 import csv
 import time
-import flux 
+
 import json
 import os
 from tqdm import tqdm
@@ -33,7 +30,7 @@ class EngineResult:
     message: str = ""
 
 
-def run(config) -> EngineResult:
+def run(config: object, adapter: Adapter) -> EngineResult:
     """
     Core entrypoint. Eventually this will:
       - init Flux adapter
@@ -44,35 +41,24 @@ def run(config) -> EngineResult:
     """
     logger.log(1, f"[core] engine.run() got config: {config}")
 
-    # Get the flux handle
-    flux_handle = flux.Flux()
-
     # Track the KVS Size at the beginning to compare later
-    kvs_size_start = flux_stats.get_content_sqlite_dbfile_size(flux_handle)
+    kvs_size_start = int(adapter.get_kvs_stats().get("dbfile_size", 0))
 
     # Configure our simulated exec system and the user event simulator
     #TODO Is this validation needed or can it be overhauled?>
     exec_validator = SimpleExec(config.nnodes, config.ncpus, gpus_per_node=config.ngpus, exclusive=config.exclusive)
     simulation = Simulation(
-        flux_handle,
+        adapter,
         events.EventList(),
         {},
         submit_job_hook=exec_validator.submit_job,
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
     )
-    # Take the system resource configuration and put it in the KVS 
-    # insert_resource_data(flux_handle, args.num_ranks, args.cores_per_rank, gpus_per_rank=args.gpus_per_rank)
-    flux_resources.insert_resource_data(flux_handle, config.nnodes, config.ncpus, gpus_per_rank=config.ngpus)
 
-    
-    # insert_resource_R_from_json(flux_handle, rjson_path="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/tuolumne.json")
-    #
-    # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
-    # function paramater for every single module paramter 
-    flux_modules.reload_modules(flux_handle, queue_policy="conservative", match_policy="first")
+    # Configure the applicable backend (Flux)
+    adapter.configure_backend(config, simulation.start_job)
 
-    
     # Read in the job traces from the specified file and make a list of jobs
     reader = models.SacctReader(config.job_traces, require_gpus=(config.ngpus and config.ngpus > 0))
     
@@ -94,18 +80,6 @@ def run(config) -> EngineResult:
     pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
     simulation.progress = pbar
 
-    # TODO: Should be checking to see if the jobtap plugin is loaded 
-    flux_modules.load_missing_modules(flux_handle)
-
-    # Configure RPC endpoints/watchers for our program
-    watchers, services = flux_watchers.setup_watchers(flux_handle, simulation)
-
-    # TODO: Remove everything related to journal consumer. This is junk 
-    consumer = flux_journal.setup_journal(flux_handle, simulation)
-
-    # Register the exec system simulator as the exec system that we are using for Flux
-    flux_watchers.exec_hello(flux_handle)
-    
     # __________________________
     # --- SIMULATION PHASE --- |
     # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
@@ -119,15 +93,14 @@ def run(config) -> EngineResult:
 
     # Run the last set of events in the reactor. If we arent able to, we encountered an exception in our simulation
     try:
-        flux_handle.reactor_run(flux_handle.get_reactor(), 0)
+        adapter.reactor_run()
     except Exception as e:
         logger.error(f"Reactor encountered an exception: {e}")
         return EngineResult(ok=False, message="Error during simulation time")
 
-
     # Get rid of the watchers/services that we used in our simulation
     try:
-        flux_watchers.teardown_watchers(flux_handle, watchers, services)
+        adapter.close()
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
         return EngineResult(ok=False, message="Error tearing down watchers")
@@ -141,7 +114,8 @@ def run(config) -> EngineResult:
     # I had to put this delay previously because the eventlog wasn't done being updated 
     # sometimes when we finished and we had to wait a few seconds for it to finish updating
     # Probably a better method
-    time.sleep(2)
+    #TODO add a way to verify that the eventlog is done before grabbing it :)
+    # time.sleep(2)
 
     config = f"nodes{config.nnodes}_cpr{config.ncpus}" 
     kvs_outfile = f"kvs_growth_{config}.csv"
@@ -152,12 +126,12 @@ def run(config) -> EngineResult:
     simulation.dump_eventlog()
 
     # Dump out our own transition log to the file
-    filesystem_output.dump_transitions_to_csv(simulation, "job_transitions.csv", flux_handle)
+    filesystem_output.dump_transitions_to_csv(simulation, "job_transitions.csv", adapter)
 
     # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
-    filesystem_output.write_per_node_chrome_trace(simulation, "pernode.json", flux_handle)
+    filesystem_output.write_per_node_chrome_trace(simulation, "pernode.json", adapter)
 
-    kvs_size_end = flux_stats.get_content_sqlite_dbfile_size(flux_handle)
+    kvs_size_end = int(adapter.get_kvs_stats().get("dbfile_size", 0))
     completed = max(1, simulation.num_complete)  
 
     kvs_bytes_per_completed = (kvs_size_end - kvs_size_start) / float(completed)
@@ -186,16 +160,6 @@ def run(config) -> EngineResult:
     if waits:
         print(f"Max queue wait time: {max(waits):.6f} seconds (sim time)")
 
-   
-    # Reset the emu-jobtap probe to defaults after a run
-    try:
-        flux_handle.rpc("job-manager.emu-jobtap.reset",
-                        payload={"keep_timestep": False}).get()
-        logger.debug("Reset emu-jobtap probe to defaults")
-    except Exception as e:
-        logger.error(f"Failed to reset emu-jobtap probe: {e}")
-        return EngineResult(ok=False, message="Failed to reset emu-jobtap probe")
-
     return EngineResult(ok=True, message="Ran Successfully")
 
 _EVENT_LOG_FILE = "event_order_log.csv"
@@ -223,7 +187,7 @@ class Simulation(object):
     '''
     def __init__(
             self,
-            flux_handle,
+            adapter: Adapter,
             event_list,
             job_map,
             submit_job_hook=None,
@@ -234,7 +198,7 @@ class Simulation(object):
         self.event_list = event_list
         self.job_map = job_map
         self.current_time = 0
-        self.flux_handle = flux_handle
+        self.adapter = adapter
         self.num_submits = 0
         self.progress = progress
         self.num_complete = 0
@@ -258,7 +222,7 @@ class Simulation(object):
         Stores: time, dbfile_size, object_count (if available)
         """
         try:
-            st = flux_stats.get_module_stats_anyhow(self.flux_handle, self.kvs_module_name)
+            st = self.adapter.get_kvs_stats()
             self.kvs_samples.append({
                 "time": float(self.current_time),
                 "dbfile_size": int(st.get("dbfile_size", 0)),
@@ -298,7 +262,7 @@ class Simulation(object):
         if self.submit_job_hook:
             self.submit_job_hook(self, job)
         logger.debug("Submitting a new job")
-        job.submit(self.flux_handle)
+        job.submit(self.adapter)
         self.job_map[job.jobid] = job
         logger.info("Submitted job {}".format(job.jobid))
 
@@ -309,7 +273,7 @@ class Simulation(object):
         job.real_start = time.time()
         if self.start_job_hook:
             self.start_job_hook(self, job)
-        job.start(self.flux_handle, start_msg, self.current_time)
+        job.start(self.adapter, start_msg, self.current_time)
 
         ct = models.qtime(job.complete_time)
         cb = models.make_tagged_cb("complete", job, lambda: self.complete_job(job), ct)
@@ -328,7 +292,7 @@ class Simulation(object):
 
         if self.complete_job_hook:
             self.complete_job_hook(self, job)
-        job.complete(self.flux_handle)
+        job.complete(self.adapter)
         # Update tqdm progress bar
         if self.progress is not None:
             self.progress.update(1)
@@ -368,17 +332,17 @@ class Simulation(object):
             if self.num_complete < self.num_submits:
                 # Jobs in flight; ask the plugin to tell us when the system is stable.
                 logger.info("Event list empty but jobs in flight; probing jobtap for quiescence")
-                self.flux_handle.rpc(
-                    "job-manager.emu-jobtap.quiescent",
-                    payload=json.dumps({"time": self.current_time})   
-                ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
-                return  
+                self.adapter.query_quiescent(
+                    json.dumps({"time": self.current_time}),
+                    lambda fut, arg=self: arg.quiescent_cb()
+                )
+                return
             else:
                 logger.info(f"completes {self.num_complete} submits {self.num_submits}")
                 logger.info("No more events in event list, running post-sim analysis")
                 self.post_verification()
                 logger.info("Ending simulation")
-                self.flux_handle.reactor_stop(self.flux_handle.get_reactor())
+                self.adapter.end_simulation()
                 return
         logger.info("Fast-forwarding time to {}".format(self.current_time))
 
@@ -402,16 +366,20 @@ class Simulation(object):
         # write the snapshot for this bucket
         log_event_execution(_exec_rows)
 
+        logger.debug("Doing events")
         # run callbacks exactly once
         for cb in events_at_time:
             cb()
 
+        logger.debug("Sampling KVS")
         # KVS sampling (time series)
         if self.kvs_sample_every and (self.time_step % self.kvs_sample_every == 0):
             self.sample_kvs_stats()
 
+        #TODO I don't need this im pretty sure lol
         if self.time_step == 0:
-            time.sleep(0.5)
+            # time.sleep(0.5)
+            print("")
         self.time_step+=1
 
         # build expect and probe (no second execution loop!)
@@ -423,11 +391,18 @@ class Simulation(object):
                 "finishes": int(expect["finishes"]),
             },
         }
-        self.flux_handle.rpc(
-            "job-manager.emu-jobtap.quiescent",
-            payload=json.dumps(payload)
-        ).then(lambda fut, arg: arg.quiescent_cb(), arg=self)
 
+        logger.debug("Querying Quiescent")
+        try:
+            self.adapter.query_quiescent(
+                json.dumps(payload),
+                lambda fut, _arg: self.quiescent_cb(),
+            )
+
+        except Exception as e:
+            logger.critical("Quiescent broke")
+            raise RuntimeError("Quiescent broke")
+        logger.debug("went past the quiescent thing prematurely")
         if self.current_time in self.step_expect:
             del self.step_expect[self.current_time]
 
@@ -440,9 +415,8 @@ class Simulation(object):
     def quiescent_cb(self):
         '''
         Calls upon the scheduler to see if it is idle
-
-        Will call advance if it becomes idle after waiting for 100ms 
         '''
+        logger.debug("Hit quiescent")
         logger.info("Quiescent confirmed by jobtap")
         self.job_manager_quiescent = True
         self.advance()
@@ -458,9 +432,9 @@ class Simulation(object):
             if 'INACTIVE' not in job.state_transitions:
                 logger.warning(
                     "Job {} had not reached the inactive state by simulation termination time.".format(jobid))
-                eventlog = flux.job.job_kvs_lookup(
-                    self.flux_handle, jobid, keys=["eventlog"])
-                logger.debug(f"Job ID: {flux.job.JobID(eventlog['id']).f58}")
+                
+                eventlog = self.adapter.get_eventlog(jobid)
+                logger.debug(f"Job ID: {self.adapter.get_formatted_id(eventlog["id"])}")
                 lines = eventlog["eventlog"].strip().split("\n")
                 for line in lines:
                     parsed = json.loads(line)
@@ -484,7 +458,7 @@ class Simulation(object):
             writer.writeheader()
 
             for jobid, job in self.job_map.items():
-                eventlog = flux.job.job_kvs_lookup(self.flux_handle, jobid, keys=["eventlog"])
+                eventlog = self.adapter.get_eventlog(jobid)
 
                 row = {"jobid": jobid}
                 for event in fieldnames[1:]:

@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 import csv
 from abc import ABC, abstractmethod
 import logging
-from flux import job
 import time
 import json
+from flux_fiction._adapters.base import Adapter 
 
 logger = logging.getLogger(__name__)
 
@@ -200,11 +200,11 @@ class Job(object):
         self._jobspec = None  
 
 
-    def submit(self, flux_handle):
+    def submit(self, adapter: Adapter):
         jobspec_json = json.dumps(self.jobspec)
         logger.log(9, jobspec_json)
         self.real_submit = time.time()          
-        self._jobid = job.submit(flux_handle, jobspec_json)
+        self._jobid = adapter.submit_job(jobspec_json)
         logger.debug("Submitted job id %s", self._jobid)
 
 
@@ -219,36 +219,26 @@ class Job(object):
             raise ValueError("Job has not started yet")
         return self.start_time + self.elapsed_time
 
-    def start(self, flux_handle, start_msg, start_time):
+    def start(self, adapter: Adapter, start_msg, start_time):
         '''
         Records the time that the job was started by Flux and tells the job manager that the request is being handled
         '''
         self.start_time = qtime(start_time)          # quantize here
         self._start_msg = start_msg
-        flux_handle.respond(self._start_msg,
-                            payload={"id": self.jobid, "type": "start", "data": {}})
+        adapter.start_job(self._start_msg, self.jobid)
 
-    def complete(self, flux_handle):
+    def complete(self, adapter: Adapter):
         '''
         Emits the finish and release events when a job is complete
         '''
-        # TODO: emit "finish" event
-        flux_handle.respond(
-            self._start_msg,
-            payload={"id": self.jobid, "type": "finish", "data": {"status": 0}}
-        )
-        # TODO: emit "done" event
-        flux_handle.respond(
-            self._start_msg,
-            payload={"id": self.jobid, "type": "release",
-                     "data": {"ranks": "all", "final": True}}
-        )
+        adapter.complete_job(self._start_msg, self.jobid)
 
-    def cancel(self, flux_handle):
+    def cancel(self, adapter: Adapter):
         '''
         Emits the cancel event for a job
         '''
-        job.RAW.cancel(flux_handle, self.jobid, "Canceled by emulator")
+        return adapter.cancel_job(self.jobid)
+        
 
     def insert_apriori_events(self, simulation):
         '''

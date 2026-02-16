@@ -29,6 +29,8 @@ class ExperimentConfig:
     exclusive: bool = False
     quiet: bool = False
 
+    backend: Optional[str] = "flux"
+
 class ExperimentConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -49,12 +51,16 @@ class ExperimentConfigModel(BaseModel):
     exclusive: bool = False
     quiet: bool = False
 
+    backend: Optional[str] = "flux"
+
     @model_validator(mode="after")
     def _checks(self):
         if self.resource_file and self.resource_R:
             raise ValueError("Use only one of resource_file or resource_R.")
         if self.job_traces is None and self.config_file is None:
             raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
+        if self.backend != "flux" and self.backend != "mock":
+            raise ValueError("Backend must be set to either flux or mock.")
         return self
 
 def _to_dataclass(data: dict) -> ExperimentConfig:
@@ -65,23 +71,6 @@ def _to_dataclass(data: dict) -> ExperimentConfig:
         raise ValueError(str(e)) from e
 
     return ExperimentConfig(**m.model_dump())
-
-def validate_config(cfg: ExperimentConfig) -> None:
-    '''
-    validate_config
-    ----------------
-    
-    :param cfg: Takes in a ExperimentConfig object and validates if the configuration settings make sense
-    :type cfg: ExperimentConfig
-
-    Used to determine if the Flux Fiction configuration is valid or not.
-    '''
-    if cfg.resource_file and cfg.resource_R:
-        raise ValueError("Use only one of --resource_file or --resource_R.")
-    if cfg.nnodes < 0 or cfg.nsockets < 1 or cfg.ncpus < 1 or cfg.ngpus < 0:
-        raise ValueError("Invalid resource counts.")
-    if cfg.job_traces is None and cfg.config_file is None:
-        raise ValueError("No job_traces input. Provide --job_traces")
 
 def _load_toml(path: str) -> dict:
     if not os.path.exists(path):

@@ -2,107 +2,21 @@ from typing import Sequence, Union, List
 import re
 import json 
 import csv
+from flux_fiction._adapters.base import Adapter
 
-def _expand_nodelist(nl: Union[str, Sequence[Union[str,int]]]) -> List[int]:
-    """
-    Convert typical Flux/host-style nodelists into integer node indices for lanes.
-    Accepts:
-      - "0,1,2-5,9"
-      - "node[01-03,07]"  -> 1,2,3,7
-      - ["node01","node02"] -> 1,2
-      - [0,1,2]
-    """
-    if nl is None:
-        return []
-    if isinstance(nl, (list, tuple)):
-        out = []
-        for item in nl:
-            if isinstance(item, int):
-                out.append(item)
-            else:
-                m = re.search(r'(\d+)$', str(item))
-                if m:
-                    out.append(int(m.group(1)))
-        return sorted(set(out))
-
-    s = str(nl).strip()
-    if not s:
-        return []
-
-    # bracketed ranges: prefix[1-3,7]
-    m = re.match(r'^(.*)\[(.+)\]$', s)
-    if m:
-        inside = m.group(2)
-        out = []
-        for part in inside.split(','):
-            part = part.strip()
-            if '-' in part:
-                a, b = part.split('-', 1)
-                a, b = int(a), int(b)
-                step = 1 if b >= a else -1
-                for v in range(a, b + step, step):
-                    out.append(v)
-            else:
-                out.append(int(part))
-        return sorted(set(out))
-
-    # plain list/ranges: "0,1,2-5,node12"
-    out = []
-    for part in s.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part:
-            a, b = part.split('-', 1)
-            a, b = int(a), int(b)
-            step = 1 if b >= a else -1
-            out.extend(range(a, b + step, step))
-        else:
-            m = re.search(r'(\d+)$', part)
-            out.append(int(m.group(1)) if m else int(part))
-    return sorted(set(out))
-
-def flux_nodelist_by_id(flux_handle, jobid):
-    try:
-        from flux.job.list import job_list_id, get_job
-        rpc = job_list_id(flux_handle, int(jobid), attrs=["all"])
-        info = rpc.get_jobinfo()  
-        nl = getattr(info, "nodelist", "")
-        nodes = _expand_nodelist(nl)
-        if nodes:
-            return nodes
-
-        # Try unfiltered dict for inactive jobs 
-        jd = get_job(flux_handle, int(jobid))
-        if jd:
-            nl = jd.get("nodelist", "")
-            return _expand_nodelist(nl)
-    except Exception:
-        pass
-    return []
-
-def nodelist_lookup(jobid, job, flux_handle):
-    if flux_handle is not None:
-        nodes = flux_nodelist_by_id(flux_handle, jobid)
-        return nodes, "flux_nodelist" if nodes else "missing"
-    else:
-        raise Exception("dump_transitions_to_csv: You didn't pass the flux handle")
-        
-def dump_transitions_to_csv(
-    simulation,
-    filename="job_transitions.csv",
-    flux_handle=None,
-):
+def dump_transitions_to_csv(simulation, filename, adapter: Adapter):
     """
     Writes job transitions CSV and adds NODELIST (comma-separated ints).
     Nodelist is resolved via Flux job-list.list-id.
     """
+    if filename is None: 
+        raise RuntimeError("dump_transitions_to_csv: You didn't pass a filename for the job transition CSV")
     def f(x):
         return "" if x in (None, "") else f"{float(x):.6f}"
 
     rows = []
     for jobid, job in simulation.job_map.items():
-        nodes, _ = nodelist_lookup(jobid, job, flux_handle)
+        nodes, _ = adapter.nodelist_lookup(jobid)
         rows.append({
             "trace_idx": job.trace_index,
             "jobid": jobid,
@@ -136,7 +50,7 @@ def _sec_to_us(x: Union[str, float, int]) -> int:
         return 0
     return int(float(x) * 1_000_000.0)
 
-def write_per_node_chrome_trace(simulation, out_path="pernode_trace.json", flux_handle=None, pid: int = 1):
+def write_per_node_chrome_trace(simulation, out_path, adapter: Adapter, pid: int = 1):
     """
     Generates a Chrome/Perfetto trace with one lane per node:
       - tid = node index
@@ -145,6 +59,9 @@ def write_per_node_chrome_trace(simulation, out_path="pernode_trace.json", flux_
 
     Open the JSON in https://ui.perfetto.dev to see an occupancy chart.
     """
+    if out_path is None: 
+        raise RuntimeError("write_per_node_chrome_trace: You didn't pass a filename for the perfetto traces")
+    
     events = []
     threads_emitted = set()
 
@@ -165,7 +82,7 @@ def write_per_node_chrome_trace(simulation, out_path="pernode_trace.json", flux_
         if dur_us <= 0:
             continue
 
-        nodes, src = nodelist_lookup(jobid, job, flux_handle)
+        nodes, src = adapter.nodelist_lookup(jobid)
         if not nodes:
             continue
 
