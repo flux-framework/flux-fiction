@@ -41,10 +41,8 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     """
     logger.log(1, f"[core] engine.run() got config: {config}")
 
-    # Track the KVS Size at the beginning to compare later
     kvs_size_start = int(adapter.get_kvs_stats().get("dbfile_size", 0))
 
-    # Configure our simulated exec system and the user event simulator
     #TODO Is this validation needed or can it be overhauled?>
     exec_validator = SimpleExec(config.nnodes, config.ncpus, gpus_per_node=config.ngpus, exclusive=config.exclusive)
     simulation = Simulation(
@@ -56,49 +54,40 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         complete_job_hook=exec_validator.complete_job,
     )
 
-    # Configure the applicable backend (Flux)
-    adapter.configure_backend(config, simulation.start_job)
+    adapter.open(simulation)
 
-    # Read in the job traces from the specified file and make a list of jobs
+    adapter.install_resources(config)
+    adapter.reload_scheduler(config)
+    adapter.register_exec_service()
+    adapter.arm_watchers()
+    adapter.register_job_tracking()
+
+    # adapter.configure_backend(config, simulation.start_job)
+
     reader = models.SacctReader(config.job_traces, require_gpus=(config.ngpus and config.ngpus > 0))
     
     reader.validate_trace()
     jobs = list(reader.read_trace())
     
-    # Attach a traceable index to jobs for use in identifying jobs cross-run when their ID has changed
     for idx, job in enumerate(jobs):
         job.trace_index = idx  
-
-    # Set jobs as exclusive if applicable and insert the jobs start times into the event list in our user-event simulator    
+ 
     if config.exclusive:
         for job in jobs:
             job.set_exclusive(config.ncpus, config.ngpus)
     for job in jobs:
         job.insert_apriori_events(simulation)
-
-    # Create progress bar tracking completed jobs
     pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
     simulation.progress = pbar
 
-    # __________________________
-    # --- SIMULATION PHASE --- |
-    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
- 
-    # Begin the primary event loop of the user event simulator 
     simulation.advance()
 
-    # ________________________
-    # --- POST-SIM PHASE --- |
-    # ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾ 
-
-    # Run the last set of events in the reactor. If we arent able to, we encountered an exception in our simulation
     try:
-        adapter.reactor_run()
+        adapter.start_reactor()
     except Exception as e:
         logger.error(f"Reactor encountered an exception: {e}")
         return EngineResult(ok=False, message="Error during simulation time")
 
-    # Get rid of the watchers/services that we used in our simulation
     try:
         adapter.close()
     except Exception as e:
@@ -108,27 +97,19 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     if simulation.progress is not None:
         simulation.progress.close()
 
-    # Print out the results of the simulation
     exec_validator.post_analysis(simulation)
 
-    # I had to put this delay previously because the eventlog wasn't done being updated 
-    # sometimes when we finished and we had to wait a few seconds for it to finish updating
-    # Probably a better method
     #TODO add a way to verify that the eventlog is done before grabbing it :)
-    # time.sleep(2)
 
-    config = f"nodes{config.nnodes}_cpr{config.ncpus}" 
-    kvs_outfile = f"kvs_growth_{config}.csv"
+    run_id = f"nodes{config.nnodes}_cpr{config.ncpus}" 
+    kvs_outfile = f"kvs_growth_{run_id}.csv"
     simulation.dump_kvs_timeseries(kvs_outfile)
     logger.info(f"Wrote KVS time series to {kvs_outfile}")
 
-    # Dump Flux's own eventlog
     simulation.dump_eventlog()
 
-    # Dump out our own transition log to the file
     filesystem_output.dump_transitions_to_csv(simulation, "job_transitions.csv", adapter)
 
-    # Creates chrome traces that can be plugged into perfetto to view the occupancy graph during execution
     filesystem_output.write_per_node_chrome_trace(simulation, "pernode.json", adapter)
 
     kvs_size_end = int(adapter.get_kvs_stats().get("dbfile_size", 0))
@@ -144,10 +125,8 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     print(f"KVS bytes per completed job:          {kvs_bytes_per_completed:.2f} bytes/job")
     print(f"KVS growth rate:                      {kvs_growth_bytes_per_sim_s:.2f} bytes/s (sim time)")
 
-    # Average queue wait (sim-time) across jobs that actually started
     waits = []
     for job in simulation.job_map.values():
-        # queue_wait is set in Simulation.start_job(); ignore jobs that never started
         if job.queue_wait is not None:
             waits.append(float(job.queue_wait))
 
@@ -266,18 +245,18 @@ class Simulation(object):
         self.job_map[job.jobid] = job
         logger.info("Submitted job {}".format(job.jobid))
 
-    def start_job(self, jobid, start_msg):
+    def start_job(self, jobid):
         job = self.job_map[jobid]
         job.record_state_transition("STARTED", models.qtime(self.current_time))
         job.queue_wait = job.queue_wait_time()
         job.real_start = time.time()
         if self.start_job_hook:
             self.start_job_hook(self, job)
-        job.start(self.adapter, start_msg, self.current_time)
+        job.start(self.adapter, self.current_time)
 
         ct = models.qtime(job.complete_time)
         cb = models.make_tagged_cb("complete", job, lambda: self.complete_job(job), ct)
-        self.add_event(ct, cb)                   
+        self.event_list.add_event(ct, cb)                   
         self.step_expect[ct]["finishes"] += 1
 
     def complete_job(self, job):
@@ -342,7 +321,7 @@ class Simulation(object):
                 logger.info("No more events in event list, running post-sim analysis")
                 self.post_verification()
                 logger.info("Ending simulation")
-                self.adapter.end_simulation()
+                self.adapter.stop_reactor()
                 return
         logger.info("Fast-forwarding time to {}".format(self.current_time))
 
@@ -402,7 +381,7 @@ class Simulation(object):
         except Exception as e:
             logger.critical("Quiescent broke")
             raise RuntimeError("Quiescent broke")
-        logger.debug("went past the quiescent thing prematurely")
+        logger.debug("meow")
         if self.current_time in self.step_expect:
             del self.step_expect[self.current_time]
 

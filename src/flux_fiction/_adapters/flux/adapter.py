@@ -1,9 +1,8 @@
 # flux_fiction/_adapters/flux/adapter.py
 from __future__ import annotations
 import flux
-import flux
 import logging
-import json
+from collections.abc import Callable
 from . import stats
 from . import journal
 from . import modules
@@ -14,66 +13,80 @@ logger = logging.getLogger(__name__)
 
 class FluxAdapter:
     def __init__(self) -> None:
-        self._handle = None
-        self.watchers = None
-        self.services = None
-        self.consumer = None 
+        self._handle: flux.Flux | None = None
+        self._watchers = None
+        self._services = None
+        self.simulation = None
+        self.consumer = None
+        self._pending_start_msgs: dict[int, object] = {}
+        self._pending_complete_msgs: dict[int, object] = {}
 
-        self._handle = flux.Flux()
+    def open(self, simulation) -> None:
         if self._handle is None:
-            raise RuntimeError("Unable to get Flux handle. Is Flux currently running?")
-    
-    def configure_backend(self, configuration: object, start_job_cb: function) -> None:
-        '''Configure the backend to use given resource configuration'''
-        resources.insert_resource_data(self._handle, configuration.nnodes, configuration.ncpus)
-        # insert_resource_R_from_json(handle, rjson_path="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/tuolumne.json")
-        
-        # TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
-        # function paramater for every single module paramter 
-        modules.reload_modules(self._handle, queue_policy="conservative", match_policy="first")
-
-        #TODO Fix this to where it will try to load the jobtap plugin if it isn't loaded
-        modules.load_missing_modules(self._handle)
-
-        self.watchers, self.services = watchers.setup_watchers(self._handle, start_job_cb)
-
-        # TODO: Remove everything related to journal consumer. This is junk 
-        self.consumer = journal.setup_journal(self._handle)
-
-        # Register the exec system simulator as the exec system that we are using for Flux
-        #TODO See if I can use this with the exec module? Then again it might be good to have a standard interface from Flux to engine and then from engine to the exec system. 
-        watchers.exec_hello(self._handle)
+            self._handle = flux.Flux()
+        if simulation is None: 
+            raise ValueError("valid Simulation object required to start FluxAdapter")
+        self.simulation = simulation
 
     def close(self) -> None:
-        '''Shutdown any persistent services on the backend (e.g., watchers, reactor)'''
-        watchers.teardown_watchers(self._handle, self.watchers, self.services)
+        for job in self._pending_start_msgs:
+            logger.warning(f"Job {job} was allocated but not started at the end of simulation")
+            # self.cancel_job(job)
+        for job in self._pending_complete_msgs:
+            logger.warning(f"Job {job} was started but did not complete at the end of simulation")
+            # self.cancel_job(job)
+        if self._handle is None:
+            return
+        modules.reset_jobtap_plugin(self._handle)
+        if self._watchers is not None:
+            watchers.teardown_watchers(self._handle, self._watchers, self._services or set())
+        self._watchers = None
+        self._services = None
 
-        # Reset the emu-jobtap probe to defaults after a run
-        try:
-            self._handle.rpc("job-manager.emu-jobtap.reset",
-                            payload={"keep_timestep": False}).get()
-            logger.debug("Reset emu-jobtap probe to defaults")
-        except Exception as e:
-            logger.error(f"Failed to reset emu-jobtap probe: {e}")
-            #TODO Forward this exception to the engine somehow
-            # return EngineResult(ok=False, message="Failed to reset emu-jobtap probe")
+# TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
+# function paramater for every single module paramter 
+
+#TODO Fix this to where it will try to load the jobtap plugin if it isn't loaded
+
+
+# TODO: Make the journal into a logging feature 
+        
+
+#TODO See if I can use this with the exec module? Then again it might be good to have a standard interface from Flux to engine and then from engine to the exec system. 
+
+    def install_resources(self, cfg):
+        ''''''
+        resources.insert_resource_data(self._handle, cfg.nnodes, cfg.ncpus)
+        # insert_resource_R_from_json(handle, rjson_path="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/tuolumne.json")
     
-    def end_simulation(self) -> None:
-        self._handle.reactor_stop(self._handle.get_reactor())
+    def reload_scheduler(self, cfg):
+        ''''''
+        #TODO Make this configurable from the config file
+        modules.reload_modules(self._handle, queue_policy="conservative", match_policy="first")
+        modules.load_missing_modules(self._handle)
+    
+    def register_exec_service(self):
+        ''''''
+        watchers.exec_hello(self._handle)
 
-    def reactor_run(self):
+    def register_job_tracking(self):
+        self.consumer = journal.setup_journal(self._handle)
+    
+    def arm_watchers(self):
+        ''''''
+        self._watchers, self._services = watchers.setup_watchers(self._handle, self.simulation.start_job, self._pending_start_msgs, self._pending_complete_msgs)
+    
+    def start_reactor(self):
+        ''''''
         try: 
             self._handle.reactor_run(self._handle.get_reactor(), 0)
-        except: 
-            raise RuntimeError("Failed to run Flux Reactor")
+        except Exception as e:
+            raise RuntimeError("Failed to run Flux reactor") from e
 
-    def get_handle(self) -> flux.Flux:
-        if self._handle is None:
-            logger.warning("Handle was None at invocation of get_handle(). This is not normal behavior.")
-            self._handle = flux.Flux()
-            if self._handle is None:
-                raise RuntimeError("Unable to get Flux handle. Is Flux currently running?")
-        return self._handle
+
+    def stop_reactor(self):
+        ''''''
+        self._handle.reactor_stop(self._handle.get_reactor())
             
     def get_kvs_stats(self) -> dict:
         return stats.get_kvs_stats(self._handle)
@@ -85,8 +98,7 @@ class FluxAdapter:
                 "job-manager.emu-jobtap.quiescent",
                 payload=json_string).then(safe_then(return_cb), arg=None)
         except Exception as e:
-            logger.debug(e)
-            return
+            raise RuntimeError("Failed to query quiescent") from e
           
     
     def get_eventlog(self, jobid):
@@ -95,7 +107,7 @@ class FluxAdapter:
     def get_formatted_id(self, job_id):
         return flux.job.JobID(job_id).f58
 
-    def nodelist_lookup(self, jobid):
+    def nodelist_lookup(self, jobid) -> list[int]:
         if self._handle is not None:
             nodes = stats.flux_nodelist_by_id(self._handle, jobid)
             return nodes, "flux_nodelist" if nodes else "missing"
@@ -108,10 +120,13 @@ class FluxAdapter:
     def cancel_job(self, jobid):
         return flux.job.RAW.cancel(self._handle, jobid, "Canceled by emulator")
     
-    def start_job(self, msg, jobid):
+    def ack_start(self,jobid):
+        msg = self._pending_start_msgs.pop(jobid, None)
+        self._pending_complete_msgs[jobid] = msg
         self._handle.respond(msg,payload={"id": jobid, "type": "start", "data": {}})
 
-    def complete_job(self, msg, jobid):
+    def ack_complete(self, jobid):
+        msg = self._pending_complete_msgs.pop(jobid, None)
         self._handle.respond(
             msg,
             payload={"id": jobid, "type": "finish", "data": {"status": 0}}
@@ -126,14 +141,9 @@ class FluxAdapter:
 def safe_then(cb):
     def _wrapped(fut, arg):
         try:
-            # This will raise if the RPC returned an error
-            fut.get()
-        except Exception:
-            logger.exception("RPC future failed before callback %s", cb.__name__)
-            raise
-        try:
             return cb(fut, arg)
         except Exception:
             logger.exception("Exception inside .then callback %s", cb.__name__)
             raise
     return _wrapped
+

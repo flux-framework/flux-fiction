@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Callable
+
 logger = logging.getLogger(__name__)
 import flux
 
@@ -9,6 +11,7 @@ def sim_exec_start_cb(flux_handle, watcher, msg, args=None):
         payload = msg.payload
         jobid = payload["id"]
 
+        # Put the message to be consumed by sim_exec_flush_starts_cb
         ctx["pending_start_msgs"][jobid] = msg
 
         flux_handle.rpc(
@@ -19,7 +22,7 @@ def sim_exec_start_cb(flux_handle, watcher, msg, args=None):
         logger.debug(f"Error starting the job: {e}")
 
 
-def sim_exec_flush_starts_cb(flux_handle, watcher, msg, args=None):
+def sim_exec_flush_starts_cb(flux_handle, watcher, msg, arg=None):
 
     logger.debug("sim_exec_flush_starts_cb called")
 
@@ -29,16 +32,13 @@ def sim_exec_flush_starts_cb(flux_handle, watcher, msg, args=None):
         jobids = body.get("jobids", [])
 
         for jobid in jobids:
-            start_msg = ctx["pending_start_msgs"].pop(jobid, None)
-            if start_msg is None:
-                logger.error("flush-starts: unknown jobid %s", jobid)
-                continue
-
-            ctx["start_job"](jobid, start_msg)
+            # Move start msg to the complete msg list to be used in ack_complete in FluxAdapter
+            ctx["start_job"](jobid)
+             
 
         flux_handle.respond(msg, payload={"ok": True})
     except Exception as e:
-        logger.debug(f"Error starting the job: {e}")
+        logger.exception("sim_exec_flush_starts_cb failed: %r", e)
 
 
 
@@ -60,7 +60,7 @@ def service_remove(f, name):
     future = f.service_unregister(name)
     return f.future_get(future, None)
 
-def setup_watchers(flux_handle, start_job_cb):
+def setup_watchers(flux_handle, start_job_cb: Callable, pending_start_msgs: dict, pending_complete_msgs: dict):
     '''
     Adds all appropriate watchers to the emulator
 
@@ -68,9 +68,10 @@ def setup_watchers(flux_handle, start_job_cb):
     '''
     watchers = []
     services = set()
-    pending_start_msgs = {}
+
     exec_ctx = {
         "pending_start_msgs": pending_start_msgs,
+        "pending_complete_msgs": pending_complete_msgs,
         "start_job": start_job_cb,
     }
 

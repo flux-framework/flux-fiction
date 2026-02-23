@@ -83,7 +83,7 @@ def _expand_nodelist(nl: Union[str, Sequence[Union[str,int]]]) -> List[int]:
             out.append(int(m.group(1)) if m else int(part))
     return sorted(set(out))
 
-def flux_nodelist_by_id(flux_handle, jobid):
+def flux_nodelist_by_id(flux_handle, jobid) -> List[int]:
     try:
         from flux.job.list import job_list_id, get_job
         rpc = job_list_id(flux_handle, int(jobid), attrs=["all"])

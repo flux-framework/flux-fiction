@@ -79,7 +79,6 @@ class Job(object):
         self._jobid = None
         self._jobspec = None
         self._submit_future = None
-        self._start_msg = None
         self.trace_index = None     # set from reader order (see below)
         self.real_submit = None     # time.time() at actual submit()
         self.real_start  = None     # time.time() when sim_exec.start processed
@@ -219,19 +218,18 @@ class Job(object):
             raise ValueError("Job has not started yet")
         return self.start_time + self.elapsed_time
 
-    def start(self, adapter: Adapter, start_msg, start_time):
+    def start(self, adapter: Adapter, start_time):
         '''
         Records the time that the job was started by Flux and tells the job manager that the request is being handled
         '''
-        self.start_time = qtime(start_time)          # quantize here
-        self._start_msg = start_msg
-        adapter.start_job(self._start_msg, self.jobid)
+        self.start_time = qtime(start_time)        
+        adapter.ack_start(self.jobid)
 
     def complete(self, adapter: Adapter):
         '''
         Emits the finish and release events when a job is complete
         '''
-        adapter.complete_job(self._start_msg, self.jobid)
+        adapter.ack_complete(self.jobid)
 
     def cancel(self, adapter: Adapter):
         '''
