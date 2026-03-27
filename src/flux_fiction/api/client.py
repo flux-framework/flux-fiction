@@ -8,6 +8,13 @@ from flux_fiction._adapters.mock.adapter import MockAdapter
 import logging
 logger = logging.getLogger(__name__)
 
+def make_adapter(cfg):
+    try:
+        return _ADAPTERS[cfg.backend]()
+    except KeyError:
+        raise ValueError(f"Unknown backend {cfg.backend!r}. Choose from {list(_ADAPTERS)}")
+
+
 #TODO Make it where this will make in an args dict or possibly a ExperimentConfig object
 def run_experiment(args: dict) -> engine.EngineResult:
     '''
@@ -31,3 +38,4 @@ def run_experiment(args: dict) -> engine.EngineResult:
         
     logger.info(f"Running experiment with config: {cfg}")
     return engine.run(cfg, adapter)
+
