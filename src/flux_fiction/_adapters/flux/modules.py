@@ -112,6 +112,7 @@ def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
                                 "path": feasibility_module_path, "args": []}).get()
                 flux_handle.rpc("module.load", payload={
                                 "path": fluxion_qmanager_path, "args": [f"queue-policy={queue_policy}"]}).get()
+                
 
         except Exception as e:
             logger.error(e)

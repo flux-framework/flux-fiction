@@ -320,7 +320,7 @@ class Simulation(object):
                 logger.info("Event list empty but jobs in flight; probing jobtap for quiescence")
                 self.adapter.query_quiescent(
                     json.dumps({"time": self.current_time}),
-                    lambda fut, arg=self: arg.quiescent_cb()
+                    lambda fut, _arg: self.quiescent_cb()
                 )
                 return
             else:
