@@ -11,13 +11,16 @@ def sim_exec_start_cb(flux_handle, watcher, msg, args=None):
         payload = msg.payload
         jobid = payload["id"]
 
-        # Put the message to be consumed by sim_exec_flush_starts_cb
         ctx["pending_start_msgs"][jobid] = msg
 
-        flux_handle.rpc(
-            "job-manager.emu-jobtap.buffer-start",
-            payload={"jobid": jobid}
-        ).then(lambda fut, arg: None, arg=None)
+        if ctx.get("batch_job_starts", True):
+            flux_handle.rpc(
+                "job-manager.emu-jobtap.buffer-start",
+                payload={"jobid": jobid}
+            ).then(lambda fut, arg: None, arg=None)
+        else:
+            ctx["start_job"](jobid)
+
     except Exception as e:
         logger.debug(f"Error starting the job: {e}")
 
@@ -60,7 +63,7 @@ def service_remove(f, name):
     future = f.service_unregister(name)
     return f.future_get(future, None)
 
-def setup_watchers(flux_handle, start_job_cb: Callable, pending_start_msgs: dict, pending_complete_msgs: dict):
+def setup_watchers(flux_handle, start_job_cb: Callable, pending_start_msgs: dict, pending_complete_msgs: dict, batch_job_starts: bool = True):
     '''
     Adds all appropriate watchers to the emulator
 
@@ -73,6 +76,7 @@ def setup_watchers(flux_handle, start_job_cb: Callable, pending_start_msgs: dict
         "pending_start_msgs": pending_start_msgs,
         "pending_complete_msgs": pending_complete_msgs,
         "start_job": start_job_cb,
+        "batch_job_starts": bool(batch_job_starts),
     }
 
     for type_mask, topic, cb in [

@@ -11,6 +11,8 @@ import flux_fiction._outputs.filesystem_output as filesystem_output
 
 from flux_fiction._exec.simexec import SimpleExec  
 
+# from flux_fiction.telemetry import get_tracer
+
 from dataclasses import dataclass
 import logging
 from collections import defaultdict
@@ -23,6 +25,7 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# tracer = get_tracer()
 
 @dataclass(frozen=True)
 class EngineResult:
@@ -52,6 +55,7 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         submit_job_hook=exec_validator.submit_job,
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
+        batch_job_starts=config.batch_job_starts,
     )
 
     adapter.open(simulation)
@@ -80,6 +84,7 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
     simulation.progress = pbar
 
+    # with tracer.start_as_current_span("simulation.advance"):
     simulation.advance()
 
     try:
@@ -173,6 +178,7 @@ class Simulation(object):
             start_job_hook=None,
             complete_job_hook=None,
             progress=None,
+            batch_job_starts: bool = True,
     ):
         self.event_list = event_list
         self.job_map = job_map
@@ -194,6 +200,7 @@ class Simulation(object):
         self.kvs_samples = []          
         self.kvs_sample_every = 1      
         self.kvs_module_name = "content-sqlite"
+        self.batch_job_starts = bool(batch_job_starts)
 
     def sample_kvs_stats(self):
         """

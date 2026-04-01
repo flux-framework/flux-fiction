@@ -20,11 +20,19 @@ def load_missing_modules(flux_handle):
     loaded_modules = get_loaded_modules(flux_handle)
     pass
 
-def reset_jobtap_plugin(flux_handle):
+def reset_jobtap_plugin(flux_handle, *, keep_timestep=False, batch_job_starts=True):
     try:
-        flux_handle.rpc("job-manager.emu-jobtap.reset",
-                            payload={"keep_timestep": False}).get()
-        logger.debug("Reset emu-jobtap probe to defaults")
+        flux_handle.rpc(
+            "job-manager.emu-jobtap.reset",
+            payload={
+                "keep_timestep": keep_timestep,
+                "batch_job_starts": batch_job_starts,
+            },
+        ).get()
+        logger.debug(
+            "Reset emu-jobtap probe to defaults (batch_job_starts=%s)",
+            batch_job_starts,
+        )
     except Exception as e:
         logger.error(f"Failed to reset emu-jobtap probe: {e}")
 

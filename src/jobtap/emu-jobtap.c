@@ -40,7 +40,9 @@ struct emulator {
 
     unsigned long long alloc_needed;
     json_t *buf_jobids;              
-    flux_future_t *flush_req;       
+    flux_future_t *flush_req;    
+    
+    bool batch_job_starts;   
 };
 
 /* helpers */
@@ -178,7 +180,7 @@ static void flush_starts_continuation (flux_future_t *f, void *arg)
 
 static void try_flush_batched_starts(struct emulator *emu)
 {
-    if (!emu || !emu->sched_quiescent_ok) return;
+    if (!emu || !emu->batch_job_starts || !emu->sched_quiescent_ok) return;
     if (emu->flush_req) return; 
 
     unsigned long long started_since_wm = delta(emu->tot_start, emu->wm_start);
@@ -243,6 +245,9 @@ static bool preprobe_expectations_met(struct emulator *emu) {
  * since the last watermark. 
  */
 static bool postprobe_alloc_to_start_met(struct emulator *emu) {
+    if (!emu->batch_job_starts)
+        return true;
+        
     unsigned long long d_start = delta(emu->tot_start, emu->wm_start);
     bool ok = (d_start >= emu->alloc_needed);
     flux_log(emu->h, LOG_DEBUG,
@@ -612,6 +617,11 @@ static void buffer_start_cb(flux_t *h, flux_msg_handler_t *mh,
         flux_respond_error(h, msg, EINVAL, "bad JSON");
         return;
     }
+    if (!emu->batch_job_starts) {
+        flux_respond(h, msg, "{}");
+        json_decref(root);
+        return;
+    }
     json_t *jid = json_object_get(root, "jobid");
     if (!jid || !json_is_integer(jid)) {
         json_decref(root);
@@ -636,6 +646,7 @@ static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
     struct emulator *emu = arg;
     (void)mh;
     bool keep_timestep = false;
+    bool batch_job_starts = true;
 
     // Optional JSON payload: {"keep_timestep": true|false}
     const char *payload = NULL;
@@ -647,6 +658,9 @@ static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
             json_t *kt = json_object_get(root, "keep_timestep");
             if (kt && json_is_boolean(kt))
                 keep_timestep = json_boolean_value(kt);
+            json_t *bjs = json_object_get(root, "batch_job_starts");
+            if (bjs && json_is_boolean(bjs))
+                batch_job_starts = json_boolean_value(bjs);
             json_decref(root);
         } else {
             // If payload is bad, just ignore and proceed with defaults.
@@ -655,6 +669,8 @@ static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
     }
 
     emulator_reset(emu, keep_timestep);
+    emu->batch_job_starts = batch_job_starts;
+    flux_log(h, LOG_INFO, "emu-jobtap: batch_job_starts=%d", emu->batch_job_starts ? 1 : 0);
     flux_respond(h, msg, "{}");
 }
 
@@ -664,7 +680,7 @@ int flux_plugin_init (flux_plugin_t *p)
 {
     struct emulator *emu = emulator_create();
     if (!emu) return -1;
-
+    emu->batch_job_starts = true;
     emu->timestep = 0;
     emu->h = flux_jobtap_get_flux(p);
     if (!emu->h) {

@@ -30,6 +30,7 @@ class ExperimentConfig:
     quiet: bool = False
 
     backend: Optional[str] = "flux"
+    batch_job_starts: bool = True
 
 class ExperimentConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +53,7 @@ class ExperimentConfigModel(BaseModel):
     quiet: bool = False
 
     backend: Optional[str] = "flux"
+    batch_job_starts: bool = True
 
     @model_validator(mode="after")
     def _checks(self):
@@ -153,7 +155,7 @@ def setup_logging(*, level: int, log_file: Optional[str] = None, quiet: bool = F
     Configure logging once for the whole application.
     All modules should only do `logger = logging.getLogger(__name__)`.
     """
-    root = logging.getLogger()  # root logger
+    root = logging.getLogger()  
     root.setLevel(level)
 
     # Remove existing handlers to prevent duplicated logs in reruns/tests

@@ -27,6 +27,11 @@ class FluxAdapter:
         if simulation is None: 
             raise ValueError("valid Simulation object required to start FluxAdapter")
         self.simulation = simulation
+        modules.reset_jobtap_plugin(
+            self._handle,
+            keep_timestep=False,
+            batch_job_starts=self.simulation.batch_job_starts,
+        )
 
     def close(self) -> None:
         for job in self._pending_start_msgs:
@@ -37,7 +42,11 @@ class FluxAdapter:
             # self.cancel_job(job)
         if self._handle is None:
             return
-        modules.reset_jobtap_plugin(self._handle)
+        modules.reset_jobtap_plugin(
+            self._handle,
+            keep_timestep=False,
+            batch_job_starts=True,
+        )
         if self._watchers is not None:
             watchers.teardown_watchers(self._handle, self._watchers, self._services or set())
         self._watchers = None
@@ -62,7 +71,7 @@ class FluxAdapter:
     def reload_scheduler(self, cfg):
         ''''''
         #TODO Make this configurable from the config file
-        modules.reload_modules(self._handle, queue_policy="conservative", match_policy="first")
+        modules.reload_modules(self._handle, queue_policy="conservative", match_policy="lonodex")
         modules.load_missing_modules(self._handle)
     
     def register_exec_service(self):
@@ -74,7 +83,7 @@ class FluxAdapter:
     
     def arm_watchers(self):
         ''''''
-        self._watchers, self._services = watchers.setup_watchers(self._handle, self.simulation.start_job, self._pending_start_msgs, self._pending_complete_msgs)
+        self._watchers, self._services = watchers.setup_watchers(self._handle, self.simulation.start_job, self._pending_start_msgs, self._pending_complete_msgs, batch_job_starts=self.simulation.batch_job_starts)
     
     def start_reactor(self):
         ''''''
