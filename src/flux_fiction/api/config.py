@@ -32,6 +32,8 @@ class ExperimentConfig:
     backend: Optional[str] = "flux"
     batch_job_starts: bool = True
 
+    output_dir: Optional[str] = "./"
+
 class ExperimentConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,6 +57,8 @@ class ExperimentConfigModel(BaseModel):
     backend: Optional[str] = "flux"
     batch_job_starts: bool = True
 
+    output_dir: Optional[str] = "./"
+
     @model_validator(mode="after")
     def _checks(self):
         if self.resource_file and self.resource_R:
@@ -63,6 +67,8 @@ class ExperimentConfigModel(BaseModel):
             raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
         if self.backend != "flux" and self.backend != "mock":
             raise ValueError("Backend must be set to either flux or mock.")
+        if self.output_dir[-1] is not '/':
+            self.output_dir = self.output_dir + '/'
         return self
 
 def _to_dataclass(data: dict) -> ExperimentConfig:

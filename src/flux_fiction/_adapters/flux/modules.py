@@ -36,86 +36,165 @@ def reset_jobtap_plugin(flux_handle, *, keep_timestep=False, batch_job_starts=Tr
     except Exception as e:
         logger.error(f"Failed to reset emu-jobtap probe: {e}")
 
-def reload_modules(flux_handle, queue_policy = "fcfs", match_policy="first"):
-    '''
-    To make the resource.R that we submitted to KVS earlier register with the 
-    Flux instance, we need to reload both the resource module and scheduler in 
-    a specific order 
+import copy
+import json
+import logging
+from pathlib import Path
 
-    (Sched Unload -> Res Unload -> Res Load -> Sched Load)
 
-    It has to be in that order or the scheduler becomes confused
 
-    scheduler parameter defines if we want to use fluxion or sched simple. Eventually, we will define policies here when reloading schedulers
-    '''
+
+def _load_config_object(config_source):
+    """
+    Accept either:
+      - a Python dict already produced from `flux config get`
+      - a path to a .json file containing that object
+
+    Returns a deep-copied dict so we can mutate it safely.
+    """
+    if config_source is None:
+        return {}
+
+    if isinstance(config_source, dict):
+        return copy.deepcopy(config_source)
+
+    if isinstance(config_source, (str, Path)):
+        path = Path(config_source)
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    raise TypeError(
+        f"config_source must be dict, str, Path, or None; got {type(config_source)!r}"
+    )
+
+
+def _extract_qmanager_only_config(config_obj):
+    """
+    Return a config object containing only the sched-fluxion-qmanager table.
+
+    This avoids pushing any [resource] config that might interfere with
+    resource module args like noverify / monitor-force-up.
+    """
+    cfg = {}
+    qmgr = config_obj.get("sched-fluxion-qmanager")
+    if isinstance(qmgr, dict):
+        cfg["sched-fluxion-qmanager"] = copy.deepcopy(qmgr)
+    return cfg
+
+
+def reload_modules(flux_handle, config_source=None):
+    """
+    Reload resource + scheduler modules in the order:
+
+      Sched Unload -> Res Unload -> config.load(qmanager only)
+      -> Res Load(with raw args) -> Sched Load
+
+    config_source may be:
+      - dict from `flux config get`
+      - path to a JSON file containing that object
+      - None (skip config.load entirely)
+    """
     sched_module = "sched-simple"
-    path = None
+    sched_simple_path = None
     resource_module_path = None
     fluxion_qmanager_path = None
     fluxion_resource_path = None
-    # Acquire the path to the scheduling module being used
-    # Additionally, acquire the path to the resource module
+    feasibility_module_path = None
+
+    config_source = "/home/j/Desktop/flux/sc25_poster/flux-fiction/experiment_data/ff_traces/experiment_scheduler_easy_resdepth32_20260330_165549/flux_config.json"
+
     for module in get_loaded_modules(flux_handle):
-        logger.debug(module)
-        if "sched-simple" in module["services"]:
+        logger.debug("loaded module: %s", module)
+
+        services = module.get("services", [])
+        name = module.get("name", "")
+
+        if "sched-simple" in services:
             sched_module = module["name"]
-            path = module["path"]
-        elif "sched-fluxion-qmanager" in module["name"]:
+            sched_simple_path = module["path"]
+        elif "sched-fluxion-qmanager" in name:
             sched_module = "fluxion"
             fluxion_qmanager_path = module["path"]
-        elif "sched-fluxion-resource" in module["name"]:
+        elif "sched-fluxion-resource" in name:
             fluxion_resource_path = module["path"]
-        elif "resource" in module["name"]:
+        elif name == "resource" or "resource" in name:
             resource_module_path = module["path"]
-        elif "feasibility" in module["name"]:
+        elif "feasibility" in name:
             feasibility_module_path = module["path"]
 
-    if path:
-        logger.debug(f"{path}")
-    elif fluxion_qmanager_path:
-        logger.debug(f"fluxion_qmanager_path: {fluxion_qmanager_path}")
-    logger.debug(
-        "Reloading the '{}' and 'resource' module".format(sched_module))
-    if  resource_module_path is not None:
+    logger.debug("Reloading '%s' and 'resource' modules", sched_module)
+
+    if resource_module_path is None:
+        raise RuntimeError(
+            "Unable to get resource module path (is the resource module loaded?)"
+        )
+
+    # 1. Unload scheduler + resource
+    try:
+        if sched_module == "sched-simple":
+            flux_handle.rpc(
+                "module.remove",
+                payload={"name": "sched-simple"},
+            ).get()
+        else:
+            flux_handle.rpc(
+                "module.remove",
+                payload={"name": "sched-fluxion-qmanager"},
+            ).get()
+            flux_handle.rpc(
+                "module.remove",
+                payload={"name": "sched-fluxion-feasibility"},
+            ).get()
+            flux_handle.rpc(
+                "module.remove",
+                payload={"name": "sched-fluxion-resource"},
+            ).get()
+
+        flux_handle.rpc(
+            "module.remove",
+            payload={"name": "resource"},
+        ).get()
+
+    except Exception as e:
+        logger.error("Error removing modules: %s", e)
+        raise
+
+    # 2. Load ONLY qmanager config, if provided
+    if config_source is not None:
         try:
-            if sched_module == "sched-simple":
-                flux_handle.rpc("module.remove", payload={
-                                "name": "sched-simple"}).get()
+            full_cfg = _load_config_object(config_source)
+            qmgr_cfg = _extract_qmanager_only_config(full_cfg)
+
+            if qmgr_cfg:
+                logger.debug(
+                    "Loading qmanager-only config via config.load:\n%s",
+                    json.dumps(qmgr_cfg, indent=2, sort_keys=True),
+                )
+                flux_handle.rpc("config.load", payload=qmgr_cfg).get()
             else:
-                flux_handle.rpc("module.remove", payload={
-                                "name": "sched-fluxion-qmanager"}).get()
-                flux_handle.rpc("module.remove", payload={
-                                "name": "sched-fluxion-feasibility"}).get()
-                flux_handle.rpc("module.remove", payload={
-                                "name": "sched-fluxion-resource"}).get()
-            flux_handle.rpc("module.remove", payload={
-                            "name": "resource"}).get()
-            
-        except Exception as e:
-            logger.error(f"Error removing module: {e}")
-        
-        
-        try:
-            flux_handle.rpc("module.load",
-                            payload={
-                                "path": resource_module_path,
-                                "args": ["noverify", "monitor-force-up"],
-                            }).get()
-            if sched_module == "sched-simple":
-                flux_handle.rpc("module.load", payload={
-                                "path": path, "args": []}).get()
-            else:
-                flux_handle.rpc("module.load", payload={
-                                "path": fluxion_resource_path, "args": [f"match-policy={match_policy}"]}).get()
-                # "queue-policy=conservative"
-                flux_handle.rpc("module.load", payload={
-                                "path": feasibility_module_path, "args": []}).get()
-                flux_handle.rpc("module.load", payload={
-                                "path": fluxion_qmanager_path, "args": [f"queue-policy={queue_policy}"]}).get()
-                
+                logger.warning(
+                    "No sched-fluxion-qmanager table found in config source; "
+                    "skipping config.load"
+                )
 
         except Exception as e:
-            logger.error(e)
-    else:
-        raise RuntimeError(
-            "Unable to get scheduler path (is your scheduler module loaded?)")
+            logger.error("Error loading qmanager-only config: %s", e)
+            raise
+
+    # 3. Reload resource + scheduler
+    try: 
+        flux_handle.rpc("module.load", payload={"path": resource_module_path,
+                                                "args": [ "noverify", "monitor-force-up"]}).get()
+
+        flux_handle.rpc("module.load", payload={"path": fluxion_resource_path,
+                                                "args": [f"match-policy=lonodex"]}).get()
+
+        flux_handle.rpc("module.load", payload={"path": feasibility_module_path,
+                                                "args": []}).get()
+
+        flux_handle.rpc("module.load", payload={"path": fluxion_qmanager_path,
+                                                "args": []}).get()
+
+    except Exception as e:
+        logger.error("Error loading modules: %s", e)
+        raise

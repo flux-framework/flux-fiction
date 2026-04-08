@@ -56,6 +56,7 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         start_job_hook=exec_validator.start_job,
         complete_job_hook=exec_validator.complete_job,
         batch_job_starts=config.batch_job_starts,
+        output_dir = config.output_dir,
     )
 
     adapter.open(simulation)
@@ -107,15 +108,13 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     #TODO add a way to verify that the eventlog is done before grabbing it :)
 
     run_id = f"nodes{config.nnodes}_cpr{config.ncpus}" 
-    kvs_outfile = f"kvs_growth_{run_id}.csv"
+    kvs_outfile = f"{config.output_dir}kvs_growth_{run_id}.csv"
     simulation.dump_kvs_timeseries(kvs_outfile)
     logger.info(f"Wrote KVS time series to {kvs_outfile}")
 
     simulation.dump_eventlog()
-
-    filesystem_output.dump_transitions_to_csv(simulation, "job_transitions.csv", adapter)
-
-    filesystem_output.write_per_node_chrome_trace(simulation, "pernode.json", adapter)
+    filesystem_output.dump_transitions_to_csv(simulation, f"{config.output_dir}job_transitions.csv", adapter)
+    filesystem_output.write_per_node_chrome_trace(simulation, f"{config.output_dir}pernode.json", adapter)
 
     kvs_size_end = int(adapter.get_kvs_stats().get("dbfile_size", 0))
     completed = max(1, simulation.num_complete)  
@@ -146,20 +145,14 @@ def run(config: object, adapter: Adapter) -> EngineResult:
 
     return EngineResult(ok=True, message="Ran Successfully")
 
-_EVENT_LOG_FILE = "event_order_log.csv"
-_EVENT_LOG_HEADER_WRITTEN = False
-
-def log_event_execution(rows):
-    global _EVENT_LOG_HEADER_WRITTEN
-    write_header = not _EVENT_LOG_HEADER_WRITTEN or not os.path.exists(_EVENT_LOG_FILE)
-    with open(_EVENT_LOG_FILE, "a", newline="") as f:
+def log_event_execution(rows, header_written, output_dir = './'):
+    with open(f"{output_dir}event_order_log.csv", "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "time", "idx_in_bucket", "kind", "jobid", "trace_idx",
             "insertion_seq", "real_ts"
         ])
-        if write_header:
+        if not header_written:
             w.writeheader()
-            _EVENT_LOG_HEADER_WRITTEN = True
         for r in rows:
             w.writerow(r)
 
@@ -179,6 +172,7 @@ class Simulation(object):
             complete_job_hook=None,
             progress=None,
             batch_job_starts: bool = True,
+            output_dir: str = "./"
     ):
         self.event_list = event_list
         self.job_map = job_map
@@ -201,6 +195,8 @@ class Simulation(object):
         self.kvs_sample_every = 1      
         self.kvs_module_name = "content-sqlite"
         self.batch_job_starts = bool(batch_job_starts)
+        self.event_log_header_written = False
+        self.output_dir = output_dir
 
     def sample_kvs_stats(self):
         """
@@ -350,7 +346,8 @@ class Simulation(object):
             })
 
         # write the snapshot for this bucket
-        log_event_execution(_exec_rows)
+        log_event_execution(_exec_rows, self.event_log_header_written, self.output_dir)
+        self.event_log_header_written = True
 
         logger.debug("Doing events")
         # run callbacks exactly once
@@ -439,7 +436,7 @@ class Simulation(object):
             "alloc", "start", "finish", "release", "free", "clean"
         ]
 
-        with open("eventlog.csv", "w", newline="") as csvfile:
+        with open(f"{self.output_dir}eventlog.csv", "w", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 

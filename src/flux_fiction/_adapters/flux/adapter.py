@@ -71,7 +71,9 @@ class FluxAdapter:
     def reload_scheduler(self, cfg):
         ''''''
         #TODO Make this configurable from the config file
-        modules.reload_modules(self._handle, queue_policy="conservative", match_policy="lonodex")
+        # modules.reload_modules(self._handle, queue_policy="hybrid", match_policy="lonodex", res_depth=32)
+        modules.reload_modules(self._handle)
+
         modules.load_missing_modules(self._handle)
     
     def register_exec_service(self):

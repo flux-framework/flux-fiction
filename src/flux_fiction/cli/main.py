@@ -31,6 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend",         type=str, default="flux", help="Determines what backend to use for job management. Currently, only Flux and Mock are supported as this is mainly for unit testing.")
     parser.add_argument("--batch_job_starts",action="store_false", help="Option to smooth out the confirmation of job start events in the exec module. Can subtley affect scheduling behavior.")
 
+    parser.add_argument("--output_dir",      type=str, default="./", help="Directory to dump all output files to. Does not include log file.")
+    
+
     return parser
 
 
