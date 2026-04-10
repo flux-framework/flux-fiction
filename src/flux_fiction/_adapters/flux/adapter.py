@@ -72,7 +72,7 @@ class FluxAdapter:
         ''''''
         #TODO Make this configurable from the config file
         # modules.reload_modules(self._handle, queue_policy="hybrid", match_policy="lonodex", res_depth=32)
-        modules.reload_modules(self._handle)
+        modules.reload_modules(self._handle, cfg.config_json)
 
         modules.load_missing_modules(self._handle)
     

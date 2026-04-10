@@ -101,7 +101,7 @@ def reload_modules(flux_handle, config_source=None):
     fluxion_resource_path = None
     feasibility_module_path = None
 
-    config_source = "/home/j/Desktop/flux/sc25_poster/flux-fiction/experiment_data/ff_traces/experiment_scheduler_easy_resdepth32_20260330_165549/flux_config.json"
+    # config_source = "/home/j/Desktop/flux/sc25_poster/flux-fiction/experiment_data/ff_traces/experiment_scheduler_easy_resdepth32_20260330_165549/flux_config.json"
 
     for module in get_loaded_modules(flux_handle):
         logger.debug("loaded module: %s", module)
@@ -162,8 +162,8 @@ def reload_modules(flux_handle, config_source=None):
     # 2. Load ONLY qmanager config, if provided
     if config_source is not None:
         try:
-            full_cfg = _load_config_object(config_source)
-            qmgr_cfg = _extract_qmanager_only_config(full_cfg)
+            qmgr_cfg = _load_config_object(config_source)
+            # qmgr_cfg = _extract_qmanager_only_config(full_cfg)
 
             if qmgr_cfg:
                 logger.debug(

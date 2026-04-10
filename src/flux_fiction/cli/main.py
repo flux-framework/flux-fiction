@@ -12,7 +12,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--job_traces",      type=str, default=None, help="Path to historical job data/traces. Can be defined in config file.")
-    parser.add_argument("--config_file",     type=str, default=None, help="Path to configuration TOML (optional but recommended).")
+    parser.add_argument("--config_file",     type=str, default=None, help="Path to configuration TOML (optional but recommended). Do not use alongside the JSON")
+    parser.add_argument("--config_json",     type=str, default=None, help="Path to configuration JSON (optional but recommended). Do not use alongside the TOML. This was added because flux config get outputs a json, and it is designed to ingest that.")
+    parser.add_argument("--eventlog_path",     type=str, default=None, help="Path to directory containing eventlogs (optional). Increases accuracy by introducing realistic delays between the submit and start states of a job as well as the finish and clean states")
+
 
     parser.add_argument("--resource_file",   type=str, default=None, help="Path to resource file (e.g., JGF). Not alongside --resource_R.")
     parser.add_argument("--resource_R",      type=str, default=None, help="Path to Rlist file. Not alongside --resource_file.")

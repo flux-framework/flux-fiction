@@ -31,8 +31,6 @@ def run_experiment(args: dict) -> engine.EngineResult:
     cfg = config.from_cli_args(args)
     config.setup_logging(level=cfg.log_level, log_file=cfg.log_file, quiet=cfg.quiet)
 
-    # print(cfg.output_dir)
-
     if cfg.backend == 'flux':
         adapter = FluxAdapter()
     elif cfg.backend == 'mock':

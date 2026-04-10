@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 class ExperimentConfig:
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
+    config_json: Optional[str] = None
+    eventlog_path: Optional[str] = None
 
     resource_file: Optional[str] = None
     resource_R: Optional[str] = None
@@ -39,6 +41,8 @@ class ExperimentConfigModel(BaseModel):
 
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
+    config_json: Optional[str] = None
+    eventlog_path: Optional[str] = None
 
     resource_file: Optional[str] = None
     resource_R: Optional[str] = None
