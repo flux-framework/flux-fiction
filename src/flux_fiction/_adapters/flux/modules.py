@@ -20,18 +20,78 @@ def load_missing_modules(flux_handle):
     loaded_modules = get_loaded_modules(flux_handle)
     pass
 
-def reset_jobtap_plugin(flux_handle, *, keep_timestep=False, batch_job_starts=True):
+
+def start_all_queues(flux_handle):
+    """
+    Ensure job-manager queues are accepting scheduling work.
+
+    Reloading scheduler modules can leave job-manager queues stopped. Jobs can
+    still be submitted in that state, but they remain in SCHED without alloc
+    events because no allocation requests are sent to the scheduler.
+    """
+    payload = {"start": True, "all": True, "nocheckpoint": False}
+    try:
+        flux_handle.rpc(
+            "job-manager.queue-start",
+            payload=payload,
+            nodeid=0,
+        ).get()
+        logger.debug("Started all job-manager queues after scheduler reload")
+    except Exception as e:
+        raise RuntimeError(f"Could not start job-manager queues: {e}") from e
+
+
+def queue_status(flux_handle):
+    try:
+        queues = flux_handle.rpc("job-manager.queue-list").get()
+    except Exception as e:
+        return {"queue_list_error": repr(e)}
+
+    statuses = {"queue_list": queues}
+    names = queues.get("queues", []) if isinstance(queues, dict) else []
+    if names:
+        per_queue = {}
+        for name in names:
+            try:
+                per_queue[name] = flux_handle.rpc(
+                    "job-manager.queue-status",
+                    payload={"name": name},
+                    nodeid=0,
+                ).get()
+            except Exception as e:
+                per_queue[name] = {"error": repr(e)}
+        statuses["queue_status"] = per_queue
+    else:
+        try:
+            statuses["queue_status"] = flux_handle.rpc(
+                "job-manager.queue-status",
+                payload={},
+                nodeid=0,
+            ).get()
+        except Exception as e:
+            statuses["queue_status_error"] = repr(e)
+    return statuses
+
+def reset_jobtap_plugin(
+    flux_handle,
+    *,
+    keep_timestep=False,
+    batch_job_starts=True,
+    log_enabled=False,
+):
     try:
         flux_handle.rpc(
             "job-manager.emu-jobtap.reset",
             payload={
                 "keep_timestep": keep_timestep,
                 "batch_job_starts": batch_job_starts,
+                "log_enabled": log_enabled,
             },
         ).get()
         logger.debug(
-            "Reset emu-jobtap probe to defaults (batch_job_starts=%s)",
+            "Reset emu-jobtap probe to defaults (batch_job_starts=%s, log_enabled=%s)",
             batch_job_starts,
+            log_enabled,
         )
     except Exception as e:
         logger.error(f"Failed to reset emu-jobtap probe: {e}")
@@ -194,6 +254,8 @@ def reload_modules(flux_handle, config_source=None):
 
         flux_handle.rpc("module.load", payload={"path": fluxion_qmanager_path,
                                                 "args": []}).get()
+
+        start_all_queues(flux_handle)
 
     except Exception as e:
         logger.error("Error loading modules: %s", e)

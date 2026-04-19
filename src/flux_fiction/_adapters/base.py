@@ -14,6 +14,9 @@ class Adapter(Protocol):
     def install_resources(self, cfg: object) -> None:
         '''Register emulated resources with the resource manager'''
 
+    def describe_resources(self, cfg: object) -> dict:
+        '''Return simulator-facing resource counts and jobspec shape'''
+
     def reload_scheduler(self, cfg: object) -> None:
         '''Restart the scheduler and associated modules'''
 
@@ -40,6 +43,12 @@ class Adapter(Protocol):
     
     def get_eventlog(self, jobid: int) -> dict[str, Any]:
         '''Get the eventlog for a job'''
+
+    def get_job_diagnostics(self, jobid: int) -> dict[str, Any]:
+        '''Return best-effort scheduler/job-manager diagnostics for a job'''
+
+    def check_jobspec_satisfiability(self, jobspec_json: str) -> dict[str, Any]:
+        '''Return best-effort scheduler satisfiability diagnostics for a jobspec'''
 
     def get_formatted_id(self, job_id: int) -> str:
         '''Get the jobid in f58 format'''

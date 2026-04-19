@@ -14,7 +14,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job_traces",      type=str, default=None, help="Path to historical job data/traces. Can be defined in config file.")
     parser.add_argument("--config_file",     type=str, default=None, help="Path to configuration TOML (optional but recommended). Do not use alongside the JSON")
     parser.add_argument("--config_json",     type=str, default=None, help="Path to configuration JSON (optional but recommended). Do not use alongside the TOML. This was added because flux config get outputs a json, and it is designed to ingest that.")
-    parser.add_argument("--eventlog_path",     type=str, default=None, help="Path to directory containing eventlogs (optional). Increases accuracy by introducing realistic delays between the submit and start states of a job as well as the finish and clean states")
 
 
     parser.add_argument("--resource_file",   type=str, default=None, help="Path to resource file (e.g., JGF). Not alongside --resource_R.")
@@ -33,9 +32,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--backend",         type=str, default="flux", help="Determines what backend to use for job management. Currently, only Flux and Mock are supported as this is mainly for unit testing.")
     parser.add_argument("--batch_job_starts",action="store_false", help="Option to smooth out the confirmation of job start events in the exec module. Can subtley affect scheduling behavior.")
+    parser.set_defaults(account_system_latency=None)
+    parser.add_argument("--account-system-latency", "--account_system_latency", dest="account_system_latency", action="store_true", help="Stamp starts from current faketime after the start ack, folding scheduler/emulator latency into job timing.")
+    parser.add_argument("--no-account-system-latency", "--no_account_system_latency", dest="account_system_latency", action="store_false", help="Stamp starts from simulation event time, ignoring scheduler/emulator latency.")
+    parser.set_defaults(jobtap_logging=None)
+    parser.add_argument("--jobtap_logging", "--jobtap-logging", dest="jobtap_logging", action="store_true", help="Enable verbose emu-jobtap logging.")
+    parser.add_argument("--no_jobtap_logging", "--no-jobtap-logging", dest="jobtap_logging", action="store_false", help="Disable verbose emu-jobtap logging.")
 
     parser.add_argument("--output_dir",      type=str, default="./", help="Directory to dump all output files to. Does not include log file.")
-    
+
+    parser.add_argument("--faketime_timestamp_file", "--faketime-timestamp-file", dest="faketime_timestamp_file", type=str, default=None, help="Enable libfaketime integration using this FAKETIME_TIMESTAMP_FILE path.")
+    parser.add_argument("--faketime_initial_epoch", "--faketime-initial-epoch", dest="faketime_initial_epoch", type=float, default=None, help="Fake Unix timestamp corresponding to simulation time zero.")
+    parser.add_argument("--faketime_tolerance", "--faketime-tolerance", dest="faketime_tolerance", type=float, default=None, help="Slack in seconds before treating fake time as already at or past a target.")
+    parser.add_argument("--faketime_near_event_threshold", "--faketime-near-event-threshold", dest="faketime_near_event_threshold", type=float, default=None, help="If the next event is this many seconds or less away in fake time, wait naturally instead of jumping.")
+    parser.add_argument("--faketime_seed", "--faketime-seed", dest="faketime_seed", action="store_true", default=None, help="Seed the faketime timestamp file at startup.")
+    parser.add_argument("--faketime_no_seed", "--faketime-no-seed", dest="faketime_seed", action="store_false", help="Do not seed the faketime timestamp file at startup; require an existing relative offset.")
 
     return parser
 

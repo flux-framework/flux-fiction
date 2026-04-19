@@ -43,6 +43,7 @@ struct emulator {
     flux_future_t *flush_req;    
     
     bool batch_job_starts;   
+    bool log_enabled;
 };
 
 /* helpers */
@@ -103,8 +104,10 @@ static void emulator_reset(struct emulator *emu, bool keep_timestep)
     if (!keep_timestep)
         emu->timestep = 0;
 
-    flux_log(emu->h, LOG_INFO, "emu-jobtap: probe state reset (keep_timestep=%d)",
-             keep_timestep ? 1 : 0);
+    if (emu->log_enabled) {
+        flux_log(emu->h, LOG_INFO, "emu-jobtap: probe state reset (keep_timestep=%d)",
+                 keep_timestep ? 1 : 0);
+    }
 }
 
 static inline unsigned long long delta(unsigned long long total,
@@ -115,7 +118,7 @@ static inline unsigned long long delta(unsigned long long total,
 
 static void log_snapshot(struct emulator *emu, const char *where)
 {
-    if (!emu) return;
+    if (!emu || !emu->log_enabled) return;
 
     unsigned long long d_sched    = delta(emu->tot_sched,    emu->wm_sched);
     unsigned long long d_alloc    = delta(emu->tot_alloc,    emu->wm_alloc);
@@ -169,7 +172,8 @@ static void flush_starts_continuation (flux_future_t *f, void *arg)
         flux_log_error(emu->h, "flush-starts failed: %s",
                        flux_future_error_string(f));
     } else {
-        flux_log(emu->h, LOG_DEBUG, "flush-starts acked");
+        if (emu->log_enabled)
+            flux_log(emu->h, LOG_DEBUG, "flush-starts acked");
     }
 
     flux_future_destroy(f);
@@ -232,11 +236,13 @@ static bool preprobe_expectations_met(struct emulator *emu) {
     bool ok_sched    = (d_sched    >= emu->exp_submits);
     bool ok_inactive = (d_inactive >= emu->exp_finishes);
 
-    flux_log(emu->h, LOG_DEBUG,
-        "preprobe_check: d_sched=%llu need=%llu, d_inactive=%llu need=%llu => %s",
-        (unsigned long long)d_sched,    (unsigned long long)emu->exp_submits,
-        (unsigned long long)d_inactive, (unsigned long long)emu->exp_finishes,
-        (ok_sched && ok_inactive) ? "MET" : "WAITING");
+    if (emu->log_enabled) {
+        flux_log(emu->h, LOG_DEBUG,
+            "preprobe_check: d_sched=%llu need=%llu, d_inactive=%llu need=%llu => %s",
+            (unsigned long long)d_sched,    (unsigned long long)emu->exp_submits,
+            (unsigned long long)d_inactive, (unsigned long long)emu->exp_finishes,
+            (ok_sched && ok_inactive) ? "MET" : "WAITING");
+    }
 
     return ok_sched && ok_inactive;
 }
@@ -245,16 +251,17 @@ static bool preprobe_expectations_met(struct emulator *emu) {
  * since the last watermark. 
  */
 static bool postprobe_alloc_to_start_met(struct emulator *emu) {
-    if (!emu->batch_job_starts)
-        return true;
-        
     unsigned long long d_start = delta(emu->tot_start, emu->wm_start);
     bool ok = (d_start >= emu->alloc_needed);
-    flux_log(emu->h, LOG_DEBUG,
-             "postprobe_check starts: d_start=%llu need=%llu => %s",
-             (unsigned long long)d_start,
-             (unsigned long long)emu->alloc_needed,
-             ok ? "MET" : "WAITING");
+
+    if (emu->log_enabled) {
+        flux_log(emu->h, LOG_DEBUG,
+                 "postprobe_check starts: d_start=%llu need=%llu batch_job_starts=%d => %s",
+                 (unsigned long long)d_start,
+                 (unsigned long long)emu->alloc_needed,
+                 emu->batch_job_starts ? 1 : 0,
+                 ok ? "MET" : "WAITING");
+    }
     return ok;
 }
 
@@ -298,15 +305,18 @@ static void maybe_finish_after_quiescence(struct emulator *emu)
     log_snapshot(emu, "maybe_finish_after_quiescence(check)");
 
     if (postprobe_alloc_to_start_met(emu)) {
-        flux_log(emu->h, LOG_DEBUG, "postprobe guard met; replying to emulator");
+        if (emu->log_enabled)
+            flux_log(emu->h, LOG_DEBUG, "postprobe guard met; replying to emulator");
         reply_and_advance(emu);
     } else {
         unsigned long long d_start = delta(emu->tot_start, emu->wm_start);
         unsigned long long outstanding = (emu->alloc_needed > d_start)
                                          ? (emu->alloc_needed - d_start) : 0ULL;
-        flux_log(emu->h, LOG_DEBUG,
-                 "waiting (starts): outstanding=%llu",
-                 (unsigned long long)outstanding);
+        if (emu->log_enabled) {
+            flux_log(emu->h, LOG_DEBUG,
+                     "waiting (starts): outstanding=%llu",
+                     (unsigned long long)outstanding);
+        }
     }
 }
 
@@ -331,9 +341,11 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg)
         json_error_t jerr;
         json_t *root = json_loads(s, 0, &jerr);
         if (!root) {
-            flux_log(emu->h, LOG_WARNING,
-                     "sched.quiescent: bad JSON payload: %s (%d:%d); payload starts with: '%c'",
-                     jerr.text, jerr.line, jerr.column, s[0]);
+            if (emu->log_enabled) {
+                flux_log(emu->h, LOG_WARNING,
+                         "sched.quiescent: bad JSON payload: %s (%d:%d); payload starts with: '%c'",
+                         jerr.text, jerr.line, jerr.column, s[0]);
+            }
             emu->sched_quiescent_ok = false;
             emu->alloc_needed = 0ULL;
         } else {
@@ -374,20 +386,24 @@ static void sched_quiescent_continuation(flux_future_t *f, void *arg)
                     ? (alloc_current - carryover)
                     : 0ULL;
 
-            flux_log(emu->h, LOG_DEBUG,
-                     "sched.quiescent: alloc_current=%llu active_at_wm=%llu finishes=%llu "
-                     "carryover=%llu alloc_needed=%llu",
-                     (unsigned long long)alloc_current,
-                     (unsigned long long)active_at_wm,
-                     (unsigned long long)finishes_this_step,
-                     (unsigned long long)carryover,
-                     (unsigned long long)emu->alloc_needed);
+            if (emu->log_enabled) {
+                flux_log(emu->h, LOG_DEBUG,
+                         "sched.quiescent: alloc_current=%llu active_at_wm=%llu finishes=%llu "
+                         "carryover=%llu alloc_needed=%llu",
+                         (unsigned long long)alloc_current,
+                         (unsigned long long)active_at_wm,
+                         (unsigned long long)finishes_this_step,
+                         (unsigned long long)carryover,
+                         (unsigned long long)emu->alloc_needed);
+            }
 
             try_flush_batched_starts(emu);
 
-            flux_log(emu->h, LOG_DEBUG,
-                     "sched_quiescent_continuation: status=%d alloc_current=%llu",
-                     status, (unsigned long long)alloc_current);
+            if (emu->log_enabled) {
+                flux_log(emu->h, LOG_DEBUG,
+                         "sched_quiescent_continuation: status=%d alloc_current=%llu",
+                         status, (unsigned long long)alloc_current);
+            }
 
             json_decref(root);
 
@@ -412,7 +428,8 @@ static void send_sched_quiescent(struct emulator *emu) {
         emu->sched_req = NULL;
     }
 
-    flux_log(emu->h, LOG_DEBUG, "sending sched.quiescent");
+    if (emu->log_enabled)
+        flux_log(emu->h, LOG_DEBUG, "sending sched.quiescent");
     log_snapshot(emu, "before_sched_quiescent_rpc");
 
     emu->sched_req = flux_rpc(emu->h, "sched.quiescent", NULL, 0, 0);
@@ -454,14 +471,17 @@ static void maybe_start_probe(struct emulator *emu) {
     if (!preprobe_expectations_met(emu)) {
         unsigned long long d_sched    = delta(emu->tot_sched,    emu->wm_sched);
         unsigned long long d_inactive = delta(emu->tot_inactive, emu->wm_inactive);
-        flux_log(emu->h, LOG_DEBUG,
-                 "waiting (preprobe): remaining sched=%lld inactive=%lld",
-                 (long long)((emu->exp_submits  > d_sched)    ? (emu->exp_submits  - d_sched)    : 0),
-                 (long long)((emu->exp_finishes > d_inactive) ? (emu->exp_finishes - d_inactive) : 0));
+        if (emu->log_enabled) {
+            flux_log(emu->h, LOG_DEBUG,
+                     "waiting (preprobe): remaining sched=%lld inactive=%lld",
+                     (long long)((emu->exp_submits  > d_sched)    ? (emu->exp_submits  - d_sched)    : 0),
+                     (long long)((emu->exp_finishes > d_inactive) ? (emu->exp_finishes - d_inactive) : 0));
+        }
         return;
     }
 
-    flux_log(emu->h, LOG_DEBUG, "preprobe thresholds met; probing scheduler");
+    if (emu->log_enabled)
+        flux_log(emu->h, LOG_DEBUG, "preprobe thresholds met; probing scheduler");
     send_sched_quiescent(emu);
 }
 
@@ -474,10 +494,12 @@ static void quiescent_cb(flux_t *h, flux_msg_handler_t *mh,
     (void)h; (void)mh;
     if (!emu) return;
 
-    flux_log(emu->h, LOG_DEBUG, "received emulator quiescent probe");
+    if (emu->log_enabled)
+        flux_log(emu->h, LOG_DEBUG, "received emulator quiescent probe");
 
     if (emu->sim_req) {
-        flux_log(emu->h, LOG_WARNING, "replacing outstanding emulator request");
+        if (emu->log_enabled)
+            flux_log(emu->h, LOG_WARNING, "replacing outstanding emulator request");
         flux_msg_destroy(emu->sim_req);
         emu->sim_req = NULL;
     }
@@ -496,12 +518,15 @@ static void quiescent_cb(flux_t *h, flux_msg_handler_t *mh,
     emu->sched_quiescent_ok = false;
 
     if (payload && *payload) {
-        flux_log(emu->h, LOG_DEBUG, "<------------------------- TIMESTEP %ld ------------------------->", emu->timestep);
+        if (emu->log_enabled)
+            flux_log(emu->h, LOG_DEBUG, "<------------------------- TIMESTEP %ld ------------------------->", emu->timestep);
         json_error_t jerr;
         json_t *root = json_loads(payload, 0, &jerr);
         if (!root) {
-            flux_log(emu->h, LOG_WARNING, "bad JSON payload: %s (%d:%d)",
-                     jerr.text, jerr.line, jerr.column);
+            if (emu->log_enabled) {
+                flux_log(emu->h, LOG_WARNING, "bad JSON payload: %s (%d:%d)",
+                         jerr.text, jerr.line, jerr.column);
+            }
         } else {
             json_t *expect = json_object_get(root, "expect");
             if (expect && json_is_object(expect)) {
@@ -517,9 +542,11 @@ static void quiescent_cb(flux_t *h, flux_msg_handler_t *mh,
         emu->timestep += 1;
     }
 
-    flux_log(emu->h, LOG_DEBUG, "expect: submits=%llu finishes=%llu",
-             (unsigned long long)emu->exp_submits,
-             (unsigned long long)emu->exp_finishes);
+    if (emu->log_enabled) {
+        flux_log(emu->h, LOG_DEBUG, "expect: submits=%llu finishes=%llu",
+                 (unsigned long long)emu->exp_submits,
+                 (unsigned long long)emu->exp_finishes);
+    }
 
     /* Snapshot at probe time */
     log_snapshot(emu, "probe_arrival");
@@ -647,6 +674,7 @@ static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
     (void)mh;
     bool keep_timestep = false;
     bool batch_job_starts = true;
+    bool log_enabled = emu ? emu->log_enabled : true;
 
     // Optional JSON payload: {"keep_timestep": true|false}
     const char *payload = NULL;
@@ -661,16 +689,25 @@ static void reset_cb(flux_t *h, flux_msg_handler_t *mh,
             json_t *bjs = json_object_get(root, "batch_job_starts");
             if (bjs && json_is_boolean(bjs))
                 batch_job_starts = json_boolean_value(bjs);
+            json_t *le = json_object_get(root, "log_enabled");
+            if (le && json_is_boolean(le))
+                log_enabled = json_boolean_value(le);
             json_decref(root);
         } else {
             // If payload is bad, just ignore and proceed with defaults.
-            flux_log(h, LOG_WARNING, "reset: bad JSON payload; using defaults");
+            if (log_enabled)
+                flux_log(h, LOG_WARNING, "reset: bad JSON payload; using defaults");
         }
     }
 
+    emu->log_enabled = log_enabled;
     emulator_reset(emu, keep_timestep);
     emu->batch_job_starts = batch_job_starts;
-    flux_log(h, LOG_INFO, "emu-jobtap: batch_job_starts=%d", emu->batch_job_starts ? 1 : 0);
+    if (emu->log_enabled) {
+        flux_log(h, LOG_INFO, "emu-jobtap: batch_job_starts=%d log_enabled=%d",
+                 emu->batch_job_starts ? 1 : 0,
+                 emu->log_enabled ? 1 : 0);
+    }
     flux_respond(h, msg, "{}");
 }
 
@@ -681,6 +718,7 @@ int flux_plugin_init (flux_plugin_t *p)
     struct emulator *emu = emulator_create();
     if (!emu) return -1;
     emu->batch_job_starts = true;
+    emu->log_enabled = true;
     emu->timestep = 0;
     emu->h = flux_jobtap_get_flux(p);
     if (!emu->h) {

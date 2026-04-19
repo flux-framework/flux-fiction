@@ -5,17 +5,99 @@ from typing import Optional, Any
 import logging
 import sys
 import os
+from pathlib import Path
 from pydantic import BaseModel, Field, model_validator, ValidationError, ConfigDict
 
 
 logger = logging.getLogger(__name__)
+
+_PATH_FIELDS = {
+    "job_traces": False,
+    "config_file": False,
+    "config_json": False,
+    "resource_file": False,
+    "resource_R": False,
+    "output_dir": True,
+    "log_file": True,
+    "faketime_timestamp_file": True,
+}
+
+
+def _parse_path_map_entry(entry: str) -> tuple[str, str]:
+    if "=" in entry:
+        src, dst = entry.split("=", 1)
+    elif ">" in entry:
+        src, dst = entry.split(">", 1)
+    else:
+        raise ValueError(
+            "path map entries must look like '/host/prefix=/container/prefix'"
+        )
+    src = src.rstrip("/")
+    dst = dst.rstrip("/")
+    if not src or not dst:
+        raise ValueError("path map source and destination must be non-empty")
+    return src, dst
+
+
+def _path_mappings() -> list[tuple[str, str]]:
+    mappings: list[tuple[str, str]] = []
+    raw = os.environ.get("FLUX_FICTION_PATH_MAP", "")
+    for entry in raw.split(os.pathsep):
+        entry = entry.strip()
+        if entry:
+            mappings.append(_parse_path_map_entry(entry))
+
+    # Common host/container mount used by the Flux Fiction dev container.
+    if Path("/work/flux").exists():
+        mappings.append(("/home/j/Desktop/flux", "/work/flux"))
+    if Path("/home/j/Desktop/flux").exists():
+        mappings.append(("/work/flux", "/home/j/Desktop/flux"))
+
+    # Prefer the longest prefix when multiple mappings could match.
+    return sorted(dict.fromkeys(mappings), key=lambda item: len(item[0]), reverse=True)
+
+
+def _is_under(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _rewrite_path(value: str, *, for_output: bool = False) -> str:
+    if not value:
+        return value
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return str(path)
+    if path.exists():
+        return str(path)
+
+    raw_path = str(path)
+    for src, dst in _path_mappings():
+        if not _is_under(raw_path, src):
+            continue
+
+        suffix = raw_path[len(src):].lstrip("/")
+        candidate = Path(dst) / suffix if suffix else Path(dst)
+        if for_output or candidate.exists():
+            logger.info("Rewriting path %s -> %s", raw_path, candidate)
+            return str(candidate)
+
+    return raw_path
+
+
+def _normalize_config_paths(data: dict) -> dict:
+    normalized = dict(data)
+    for key, for_output in _PATH_FIELDS.items():
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = _rewrite_path(value, for_output=for_output)
+    return normalized
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
     config_json: Optional[str] = None
-    eventlog_path: Optional[str] = None
 
     resource_file: Optional[str] = None
     resource_R: Optional[str] = None
@@ -33,8 +115,18 @@ class ExperimentConfig:
 
     backend: Optional[str] = "flux"
     batch_job_starts: bool = True
+    account_system_latency: bool = True
+    jobtap_logging: bool = False
+    rabbit_storage_emit_dw: bool = False
+    rabbit_storage_name: str = "rabbit"
 
     output_dir: Optional[str] = "./"
+
+    faketime_timestamp_file: Optional[str] = None
+    faketime_initial_epoch: float = 0.0
+    faketime_seed: bool = True
+    faketime_tolerance: float = 1e-6
+    faketime_near_event_threshold: float = 0.0
 
 class ExperimentConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -42,7 +134,6 @@ class ExperimentConfigModel(BaseModel):
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
     config_json: Optional[str] = None
-    eventlog_path: Optional[str] = None
 
     resource_file: Optional[str] = None
     resource_R: Optional[str] = None
@@ -60,8 +151,18 @@ class ExperimentConfigModel(BaseModel):
 
     backend: Optional[str] = "flux"
     batch_job_starts: bool = True
+    account_system_latency: bool = True
+    jobtap_logging: bool = False
+    rabbit_storage_emit_dw: bool = False
+    rabbit_storage_name: str = "rabbit"
 
     output_dir: Optional[str] = "./"
+
+    faketime_timestamp_file: Optional[str] = None
+    faketime_initial_epoch: float = 0.0
+    faketime_seed: bool = True
+    faketime_tolerance: float = Field(default=1e-6, ge=0)
+    faketime_near_event_threshold: float = Field(default=0.0, ge=0)
 
     @model_validator(mode="after")
     def _checks(self):
@@ -71,12 +172,14 @@ class ExperimentConfigModel(BaseModel):
             raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
         if self.backend != "flux" and self.backend != "mock":
             raise ValueError("Backend must be set to either flux or mock.")
-        if self.output_dir[-1] is not '/':
+        if self.output_dir[-1] != '/':
             self.output_dir = self.output_dir + '/'
         return self
 
 def _to_dataclass(data: dict) -> ExperimentConfig:
     try:
+        data = {k: v for k, v in data.items() if v is not None}
+        data = _normalize_config_paths(data)
         m = ExperimentConfigModel.model_validate(data)
     except ValidationError as e:
         # make CLI/TOML errors readable
@@ -115,7 +218,7 @@ def from_toml(args: dict) -> ExperimentConfig:
       - Top-level keys, or
       - A [flux_fiction] table.
     '''
-    cfg_path = args.config_file
+    cfg_path = _rewrite_path(args.config_file)
     if not cfg_path:
         raise ValueError("from_toml called but args.config_file is missing")
     
@@ -133,6 +236,22 @@ def from_toml(args: dict) -> ExperimentConfig:
     cli_job_traces = getattr(args, "job_traces", None) if not isinstance(args, dict) else args.get("job_traces")
     if cli_job_traces is not None:
         merged["job_traces"] = cli_job_traces
+
+    cli_overrides = [
+        "faketime_timestamp_file",
+        "faketime_initial_epoch",
+        "faketime_seed",
+        "faketime_tolerance",
+        "faketime_near_event_threshold",
+        "account_system_latency",
+        "jobtap_logging",
+    ]
+    for key in cli_overrides:
+        value = getattr(args, key, None) if not isinstance(args, dict) else args.get(key)
+        if value is not None:
+            merged[key] = value
+
+    merged = _normalize_config_paths(merged)
 
     try:
         model = ExperimentConfigModel.model_validate(merged)

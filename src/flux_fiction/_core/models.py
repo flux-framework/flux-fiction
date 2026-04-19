@@ -2,18 +2,18 @@
 from collections import namedtuple
 from typing import Sequence
 import math
-import re 
+import re
 from datetime import datetime, timedelta
 import csv
 from abc import ABC, abstractmethod
 import logging
 import time
 import json
-from flux_fiction._adapters.base import Adapter 
+from flux_fiction._adapters.base import Adapter
 
 logger = logging.getLogger(__name__)
 
-TIME_QUANTUM = 1e-6  
+TIME_QUANTUM = 1e-6
 
 def qtime(t) -> float:
     return round(float(t) / TIME_QUANTUM) * TIME_QUANTUM
@@ -30,9 +30,9 @@ def make_tagged_cb(kind, job, fn, time_value):
         return fn()
 
     # attach debug metadata to the function object
-    cb._ev_kind = kind                    
+    cb._ev_kind = kind
     cb._ev_time = time_value
-    cb._ev_seq_add = seq                    
+    cb._ev_seq_add = seq
     cb._ev_jobid = getattr(job, "jobid", None) if job else None
     cb._ev_trace_idx = getattr(job, "trace_index", None) if job else None
     return cb
@@ -41,7 +41,7 @@ def create_resource(res_type, count, with_child=None):
     '''
     Creates a resource dictionary for a Job
 
-    Note: 'count' variable must be of type int. Otherwise it will cause issues during scheduling. 
+    Note: 'count' variable must be of type int. Otherwise it will cause issues during scheduling.
     '''
     assert isinstance(count, int) and count > 0
     res = {"type": res_type, "count": count}
@@ -63,13 +63,26 @@ class Job(object):
     '''
     Class to track individual jobs within the emulator
     '''
-    def __init__(self, nnodes, ncpus, submit_time, elapsed_time, timelimit, exitcode=0, ngpus=0):
+    def __init__(
+        self,
+        nnodes,
+        ncpus,
+        submit_time,
+        elapsed_time,
+        timelimit,
+        exitcode=0,
+        ngpus=0,
+        rabbit_storage_gib=0.0,
+        gap=0.0,
+        end_latency=0.0,
+    ):
         self.nnodes = nnodes
         self.exclusive = False
         self.cores_per_node = None
         self.gpus_per_node = None
         self.ncpus = ncpus
         self.ngpus = int(ngpus or 0)
+        self.rabbit_storage_gib = float(rabbit_storage_gib or 0.0)
         self.submit_time = submit_time
         self.elapsed_time = elapsed_time
         self.timelimit = timelimit
@@ -83,127 +96,174 @@ class Job(object):
         self.real_submit = None     # time.time() at actual submit()
         self.real_start  = None     # time.time() when sim_exec.start processed
         self.real_finish = None     # time.time() when complete_job() runs
+        self.jobspec_intermediate_types = []
+        self.jobspec_intermediate_counts = {}
+        self.rabbit_storage_resource_type = "ssd"
+        self.rabbit_storage_parent_type = None
+        self.rabbit_storage_nodes_per_parent = 0
+        self.rabbit_storage_shares_per_parent = 0
+        self.rabbit_storage_share_gib = 0.0
+        self.rabbit_storage_share_count = 0
+        self.rabbit_storage_emit_dw = False
+        self.rabbit_storage_name = "rabbit"
 
-    # @property
-    # def jobspec(self):
-    #     if self._jobspec is not None:
-    #         return self._jobspec
+        self.gap = float(gap or 0.0)
+        self.end_latency = float(end_latency or 0.0)
 
-    #     # ------------------------------------------------------------
-    #     # Build resources under the slot. If your R is node->socket->core
-    #     # (and maybe gpu), the jobspec should include a socket layer too.
-    #     # ------------------------------------------------------------
-
-    #     if self.exclusive:
-    #         # request full node capacity
-    #         if self.cores_per_node is None:
-    #             raise ValueError("exclusive=True but cores_per_node is not set")
-    #         total_cores = int(self.cores_per_node)
-
-    #         total_gpus = 0
-    #         if self.gpus_per_node:
-    #             total_gpus = int(self.gpus_per_node)
-    #     else:
-    #         assert self.ncpus % self.nnodes == 0
-    #         total_cores = math.ceil(self.ncpus / self.nnodes)
-
-    #         total_gpus = 0
-    #         if self.ngpus:
-    #             if self.ngpus % self.nnodes != 0:
-    #                 logger.warning(
-    #                     "NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
-    #                     .format(self.ngpus, self.nnodes)
-    #                 )
-    #             total_gpus = math.ceil(self.ngpus / self.nnodes)
-
-    #     # Match your tiny JGF assumption: 2 sockets per node.
-    #     # (Make this configurable later if you want.)
-    #     sockets_per_node = 2
-
-    #     # Distribute per-node requirements across sockets so we don't under-request.
-    #     cores_per_socket = math.ceil(total_cores / sockets_per_node)
-    #     gpus_per_socket  = math.ceil(total_gpus / sockets_per_node) if total_gpus else 0
-
-    #     # What each socket should contain
-    #     socket_with = [create_resource("core", int(cores_per_socket))]
-    #     if gpus_per_socket:
-    #         socket_with.append(create_resource("gpu", int(gpus_per_socket)))
-
-    #     # Add the socket layer (THIS is the key change)
-    #     socket = create_resource("socket", int(sockets_per_node), socket_with)
-
-    #     # Slot now contains sockets, not cores directly
-    #     slot = create_slot("task", 1, [socket])
-
-    #     # Node section unchanged
-    #     resource_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
-
-    #     jobspec = {
-    #         "version": 1,
-    #         "resources": [resource_section],
-    #         "tasks": [{
-    #             "command": ["command", "200"],
-    #             "slot": "task",
-    #             "count": {"per_slot": 1},
-    #         }],
-    #         "attributes": {"system": {"duration": self.timelimit}},
-    #     }
-
-    #     self._jobspec = jobspec
-    #     return self._jobspec
-    
     @property
     def jobspec(self):
         if self._jobspec is not None:
             return self._jobspec
 
-        withs = []
         if self.exclusive:
             # request full node capacity
-            core = create_resource("core", int(self.cores_per_node))
-            withs.append(core)
-            if self.gpus_per_node:
-                gpu = create_resource("gpu", int(self.gpus_per_node))
-                withs.append(gpu)
+            total_cores = int(self.cores_per_node)
+            total_gpus = int(self.gpus_per_node or 0)
         else:
             assert self.ncpus % self.nnodes == 0
-            core = create_resource("core", math.ceil(self.ncpus / self.nnodes))
-            withs.append(core)
+            total_cores = math.ceil(self.ncpus / self.nnodes)
+            total_gpus = 0
             if self.ngpus:
                 if self.ngpus % self.nnodes != 0:
-                    logger.warning("NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
-                                .format(self.ngpus, self.nnodes))
-                gpu = create_resource("gpu", math.ceil(self.ngpus / self.nnodes))
-                withs.append(gpu)
+                    logger.warning(
+                        "NGPUS ({}) not divisible by NNodes ({}); rounding up per-node request"
+                        .format(self.ngpus, self.nnodes)
+                    )
+                total_gpus = math.ceil(self.ngpus / self.nnodes)
+
+        branch_factor = 1
+        for res_type in self.jobspec_intermediate_types:
+            branch_factor *= int(self.jobspec_intermediate_counts.get(res_type, 1) or 1)
+
+        core = create_resource("core", max(1, math.ceil(total_cores / branch_factor)))
+        withs = [core]
+        if total_gpus:
+            gpu = create_resource("gpu", max(1, math.ceil(total_gpus / branch_factor)))
+            withs.append(gpu)
+
+        for res_type in reversed(self.jobspec_intermediate_types):
+            count = int(self.jobspec_intermediate_counts.get(res_type, 1) or 1)
+            withs = [create_resource(res_type, count, withs)]
 
         slot = create_slot("task", 1, withs)
-        resource_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
+        node_section = create_resource("node", self.nnodes, [slot]) if self.nnodes > 0 else slot
+        if self.exclusive and self.nnodes > 0:
+            node_section["exclusive"] = True
+
+        resource_sections = self._resource_sections_with_rabbit_storage(node_section)
+        attributes = {"system": {"duration": self.timelimit}}
+        if self.rabbit_storage_emit_dw and self.rabbit_storage_gib > 0:
+            capacity_gib = max(1, math.ceil(self.rabbit_storage_gib / max(1, self.nnodes)))
+            attributes["system"]["dw"] = (
+                "#DW jobdw type=xfs capacity={}GiB name={}"
+                .format(capacity_gib, self.rabbit_storage_name)
+            )
         jobspec = {
             "version": 1,
-            "resources": [resource_section],
+            "resources": resource_sections,
             "tasks": [{
                 "command": ["command", "200"],
                 "slot": "task",
                 "count": {"per_slot": 1},
             }],
-            "attributes": {"system": {"duration": self.timelimit}},
+            "attributes": attributes,
         }
         self._jobspec = jobspec
         return self._jobspec
+
+
+    def _resource_sections_with_rabbit_storage(self, node_section):
+        if self.rabbit_storage_share_count <= 0:
+            return [node_section]
+
+        ssd_section = create_resource(
+            self.rabbit_storage_resource_type,
+            int(self.rabbit_storage_share_count),
+        )
+        ssd_section["exclusive"] = True
+        if not self.rabbit_storage_parent_type:
+            return [node_section, ssd_section]
+
+        nodes_per_parent = int(self.rabbit_storage_nodes_per_parent or self.nnodes or 1)
+        shares_per_parent = int(self.rabbit_storage_shares_per_parent or self.rabbit_storage_share_count or 1)
+        parent_count = max(
+            1,
+            math.ceil(self.nnodes / nodes_per_parent),
+            math.ceil(self.rabbit_storage_share_count / shares_per_parent),
+        )
+        node_section = dict(node_section)
+        node_section["count"] = max(1, math.ceil(self.nnodes / parent_count))
+        ssd_section["count"] = max(1, math.ceil(self.rabbit_storage_share_count / parent_count))
+
+        return [create_resource(
+            self.rabbit_storage_parent_type,
+            parent_count,
+            [node_section, ssd_section],
+        )]
+
+
+    def set_jobspec_shape(self, shape):
+        shape = shape or {}
+        self.jobspec_intermediate_types = [
+            res_type for res_type in shape.get("intermediate_types", [])
+            if res_type
+        ]
+        self.jobspec_intermediate_counts = {
+            str(key): int(value)
+            for key, value in shape.get("intermediate_counts", {}).items()
+            if value
+        }
+        self._jobspec = None
+
+
+    def set_rabbit_storage_shape(self, storage, *, emit_dw=False, name="rabbit"):
+        storage = storage or {}
+        self.rabbit_storage_resource_type = storage.get("resource_type") or "ssd"
+        self.rabbit_storage_parent_type = storage.get("parent_type")
+        self.rabbit_storage_nodes_per_parent = int(storage.get("nodes_per_parent") or 0)
+        self.rabbit_storage_shares_per_parent = int(storage.get("shares_per_parent") or 0)
+        self.rabbit_storage_share_gib = float(storage.get("share_gib") or 0.0)
+        self.rabbit_storage_emit_dw = bool(emit_dw)
+        self.rabbit_storage_name = str(name or "rabbit")
+        if self.rabbit_storage_gib > 0 and self.rabbit_storage_share_gib > 0:
+            self.rabbit_storage_share_count = math.ceil(
+                self.rabbit_storage_gib / self.rabbit_storage_share_gib
+            )
+        else:
+            self.rabbit_storage_share_count = 0
+        self._jobspec = None
 
 
     def set_exclusive(self, cores_per_node, gpus_per_node=0):
         self.exclusive = True
         self.cores_per_node = int(cores_per_node)
         self.gpus_per_node = int(gpus_per_node or 0)
-        self._jobspec = None  
+        self._jobspec = None
 
 
     def submit(self, adapter: Adapter):
         jobspec_json = json.dumps(self.jobspec)
         logger.log(9, jobspec_json)
-        self.real_submit = time.time()          
-        self._jobid = adapter.submit_job(jobspec_json)
+        self.real_submit = time.time()
+        try:
+            self._jobid = adapter.submit_job(jobspec_json)
+        except Exception as e:
+            details = (
+                "trace_idx={trace_idx} nnodes={nnodes} ncpus={ncpus} "
+                "ngpus={ngpus} rabbit_storage_gib={rabbit_gib:.3f} "
+                "rabbit_shares={rabbit_shares}"
+            ).format(
+                trace_idx=self.trace_index,
+                nnodes=self.nnodes,
+                ncpus=self.ncpus,
+                ngpus=self.ngpus,
+                rabbit_gib=self.rabbit_storage_gib,
+                rabbit_shares=self.rabbit_storage_share_count,
+            )
+            raise RuntimeError(
+                "Job submit failed for {}: {}\nJobspec JSON:\n{}"
+                .format(details, e, jobspec_json)
+            ) from e
         logger.debug("Submitted job id %s", self._jobid)
 
 
@@ -222,8 +282,17 @@ class Job(object):
         '''
         Records the time that the job was started by Flux and tells the job manager that the request is being handled
         '''
-        self.start_time = qtime(start_time)        
+        self.mark_started(start_time)
+        self.ack_start(adapter)
+
+
+    def mark_started(self, start_time):
+        self.start_time = qtime(start_time)
+
+
+    def ack_start(self, adapter: Adapter):
         adapter.ack_start(self.jobid)
+
 
     def complete(self, adapter: Adapter):
         '''
@@ -236,19 +305,17 @@ class Job(object):
         Emits the cancel event for a job
         '''
         return adapter.cancel_job(self.jobid)
-        
+
 
     def insert_apriori_events(self, simulation):
         '''
         Adds the submit times for every job into the event list
 
-        This defines the order in which jobs are submitted to flux 
+        This defines the order in which jobs are submitted to flux
         '''
-        # TODO: add priority to `add_event` so that all submits for a given time
-        # can happen consecutively, followed by the waits for the jobids
         simulation.step_expect[self.submit_time]["submits"] += 1
         cb = make_tagged_cb("submit", self, lambda: simulation.submit_job(self), self.submit_time)
-        simulation.add_event(self.submit_time, cb)   # no other changes needed
+        simulation.add_event(self.submit_time, cb)
 
     def record_state_transition(self, state, time):
         '''
@@ -263,28 +330,31 @@ class Job(object):
         if sub in (None, "") or sta in (None, ""):
             return 0.0
         return max(0.0, float(sta) - float(sub))
-    
+
+
 def datetime_to_epoch(dt):
-    return int((dt - datetime(1970, 1, 1)).total_seconds())
+    """Convert a datetime to a Unix epoch. Returns float to preserve
+    sub-second precision when available."""
+    return (dt - datetime(1970, 1, 1)).total_seconds()
 
 
-re_dhms = re.compile(r"^\s*(\d+)[:-](\d+):(\d+):(\d+)\s*$")
-re_hms = re.compile(r"^\s*(\d+):(\d+):(\d+)\s*$")
+re_dhms = re.compile(r"^\s*(\d+)[:-](\d+):(\d+):(\d+(?:\.\d+)?)\s*$")
+re_hms = re.compile(r"^\s*(\d+):(\d+):(\d+(?:\.\d+)?)\s*$")
 
 def walltime_str_to_timedelta(walltime_str):
-    (days, hours, mins, secs) = (0, 0, 0, 0)
+    (days, hours, mins, secs) = (0, 0, 0, 0.0)
     match = re_dhms.search(walltime_str)
     if match:
         days = int(match.group(1))
         hours = int(match.group(2))
         mins = int(match.group(3))
-        secs = int(match.group(4))
+        secs = float(match.group(4))
     else:
         match = re_hms.search(walltime_str)
         if match:
             hours = int(match.group(1))
             mins = int(match.group(2))
-            secs = int(match.group(3))
+            secs = float(match.group(3))
     return timedelta(days=days, hours=hours, minutes=mins, seconds=secs)
 
 
@@ -304,6 +374,108 @@ class JobTraceReader(ABC):
         pass
 
 
+def _parse_submit_time(row) -> float:
+    """Extract submit time from a trace row with sub-second precision.
+
+    Priority:
+      1. t_submit column (raw epoch float) — exact, no parsing ambiguity.
+      2. Submit string with microseconds  (%Y-%m-%dT%H:%M:%S.%f)
+      3. Submit string without fractional seconds (legacy format)
+    """
+    raw = row.get("t_submit", "")
+    if raw not in (None, ""):
+        try:
+            return qtime(float(raw))
+        except (ValueError, TypeError):
+            pass
+
+    submit_str = row.get("Submit", "")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(submit_str, fmt)
+            return qtime(datetime_to_epoch(dt))
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse submit time from row: Submit={submit_str!r}, t_submit={raw!r}")
+
+
+def _parse_elapsed(row) -> float:
+    """Extract elapsed time with sub-second precision.
+
+    Priority:
+      1. elapsed_s column (raw float seconds) — exact.
+      2. Elapsed column parsed as HH:MM:SS[.fff] via walltime_str_to_timedelta.
+    """
+    raw = row.get("elapsed_s", "")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            pass
+
+    return walltime_str_to_timedelta(row["Elapsed"]).total_seconds()
+
+
+def _parse_float_field(row, field_name, default=0.0) -> float:
+    raw = row.get(field_name, "")
+    if raw in (None, "", "0"):
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        logger.warning("Invalid %s value '%s'; treating as %s", field_name, raw, default)
+        return float(default)
+
+
+_RABBIT_STORAGE_FIELDS = [
+    "RabbitStorageGiB",
+    "RabbitStorageGB",
+    "RabbitGB",
+    "RABBIT_STORAGE_GIB",
+    "RABBIT_STORAGE_GB",
+    "RABBIT_GB",
+    "SSD_GB",
+    "SSD_GIB",
+]
+
+
+def _storage_value_to_gib(raw, default_unit="GiB") -> float:
+    if raw in (None, "", "0"):
+        return 0.0
+    text = str(raw).strip()
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]i?B|[KMGT]B)?$", text, re.IGNORECASE)
+    if not match:
+        logger.warning("Invalid Rabbit storage value '%s'; treating as 0", raw)
+        return 0.0
+
+    value = float(match.group(1))
+    unit = (match.group(2) or default_unit).upper()
+    factors = {
+        "KB": 1_000 / (1024 ** 3),
+        "KIB": 1 / (1024 ** 2),
+        "MB": 1_000_000 / (1024 ** 3),
+        "MIB": 1 / 1024,
+        "GB": 1_000_000_000 / (1024 ** 3),
+        "GIB": 1,
+        "TB": 1_000_000_000_000 / (1024 ** 3),
+        "TIB": 1024,
+    }
+    return value * factors.get(unit, 1)
+
+
+def _parse_rabbit_storage_gib(row) -> float:
+    lower_to_key = {str(key).lower(): key for key in row.keys()}
+    for field in _RABBIT_STORAGE_FIELDS:
+        key = lower_to_key.get(field.lower())
+        if key is None:
+            continue
+        raw = row.get(key, "")
+        default_unit = "GiB" if "gib" in field.lower() else "GB"
+        return _storage_value_to_gib(raw, default_unit=default_unit)
+    return 0.0
+
+
 def job_from_slurm_row(row):
     '''
     generates a Job class from a sacct style job trace
@@ -315,17 +487,19 @@ def job_from_slurm_row(row):
         except Exception:
             kwargs["exitcode"] = 0
 
-    submit_time = qtime(datetime_to_epoch(datetime.strptime(row["Submit"], "%Y-%m-%dT%H:%M:%S")))
+    submit_time = _parse_submit_time(row)
 
-    elapsed = walltime_str_to_timedelta(row["Elapsed"]).total_seconds()
+    elapsed = _parse_elapsed(row)
     if elapsed <= 0:
         logger.warning("Elapsed time ({}) <= 0".format(elapsed))
+
     timelimit = walltime_str_to_timedelta(row["Timelimit"]).total_seconds()
     if elapsed > timelimit:
         logger.warning(
             "Elapsed time ({}) greater than Timelimit ({})".format(
                 elapsed, timelimit)
         )
+
     nnodes = int(row["NNodes"])
     ncpus = int(row["NCPUS"])
     if nnodes > ncpus:
@@ -352,7 +526,33 @@ def job_from_slurm_row(row):
             logger.warning("Invalid NGPUS value '{}'; treating as 0".format(row["NGPUS"]))
             ngpus = 0
 
-    return Job(nnodes, ncpus, submit_time, elapsed, timelimit, ngpus=ngpus, **kwargs)
+    rabbit_storage_gib = _parse_rabbit_storage_gib(row)
+
+    submit_latency_s = _parse_float_field(row, "submit_latency_s", default=0.0)
+    sched_latency_s = _parse_float_field(row, "sched_latency_s", default=0.0)
+    launch_latency_s = _parse_float_field(row, "launch_latency_s", default=0.0)
+
+    if sched_latency_s > 0.1:
+        sched_latency_s = 0.05
+
+    gap = submit_latency_s + sched_latency_s + launch_latency_s
+    # print(f"{submit_time}, submit: {submit_latency_s}, sched {sched_latency_s}, launch: {launch_latency_s}, total gap: {gap}")
+
+    finish_to_clean_latency_s = _parse_float_field(row, "finish_to_clean_latency_s", default=0.0)
+
+    return Job(
+        nnodes,
+        ncpus,
+        submit_time,
+        elapsed,
+        timelimit,
+        None,
+        ngpus,
+        rabbit_storage_gib=rabbit_storage_gib,
+        gap=gap,
+        end_latency=finish_to_clean_latency_s,
+        **kwargs,
+    )
 
 
 class SacctReader(JobTraceReader):
@@ -366,7 +566,7 @@ class SacctReader(JobTraceReader):
     def determine_delimiter(self):
         """
         sacct outputs data with '|' as the delimiter by default, but ',' is a more
-        common delimiter in general.  This is a simple heuristic to figure out if
+        common delimiter in general. This is a simple heuristic to figure out if
         the job trace is straight from sacct or has had some post-processing
         done that converts the delimiter to a comma.
         """
@@ -396,5 +596,5 @@ class SacctReader(JobTraceReader):
             reader = csv.DictReader(lines, delimiter=self.delim)
             jobs = [job_from_slurm_row(row) for row in reader]
         return jobs
-    
+
 Makespan = namedtuple('Makespan', ['beginning', 'end'])

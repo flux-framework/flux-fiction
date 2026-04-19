@@ -1,7 +1,9 @@
 # flux_fiction/_adapters/flux/adapter.py
 from __future__ import annotations
 import flux
+import json
 import logging
+from dataclasses import asdict, is_dataclass
 from collections.abc import Callable
 from . import stats
 from . import journal
@@ -31,6 +33,7 @@ class FluxAdapter:
             self._handle,
             keep_timestep=False,
             batch_job_starts=self.simulation.batch_job_starts,
+            log_enabled=self.simulation.jobtap_logging,
         )
 
     def close(self) -> None:
@@ -46,6 +49,7 @@ class FluxAdapter:
             self._handle,
             keep_timestep=False,
             batch_job_starts=True,
+            log_enabled=False,
         )
         if self._watchers is not None:
             watchers.teardown_watchers(self._handle, self._watchers, self._services or set())
@@ -65,8 +69,34 @@ class FluxAdapter:
 
     def install_resources(self, cfg):
         ''''''
-        resources.insert_resource_data(self._handle, cfg.nnodes, cfg.ncpus)
-        # insert_resource_R_from_json(handle, rjson_path="/home/j/Desktop/flux/sc25_poster/flux-fiction/src/python/tuolumne.json")
+        if cfg.resource_R:
+            resources.insert_resource_R_from_json(self._handle, cfg.resource_R)
+        elif cfg.resource_file:
+            resource_obj = resources.load_json_file(cfg.resource_file)
+            if resources.is_resource_r_json(resource_obj):
+                resources.insert_resource_R_obj(
+                    self._handle,
+                    resource_obj,
+                    source_path=cfg.resource_file,
+                )
+            else:
+                resources.insert_resource_data(
+                    self._handle,
+                    cfg.nnodes,
+                    cfg.ncpus,
+                    gpus_per_rank=cfg.ngpus,
+                    scheduling_obj=resource_obj,
+                )
+        else:
+            resources.insert_resource_data(
+                self._handle,
+                cfg.nnodes,
+                cfg.ncpus,
+                gpus_per_rank=cfg.ngpus,
+            )
+
+    def describe_resources(self, cfg):
+        return resources.describe_resource_config(cfg)
     
     def reload_scheduler(self, cfg):
         ''''''
@@ -113,14 +143,112 @@ class FluxAdapter:
           
     
     def get_eventlog(self, jobid):
-        return flux.job.job_kvs_lookup(self._handle, jobid, keys=["eventlog"])
+        return flux.job.job_kvs_lookup(self._handle, _lookup_jobid(jobid), keys=["eventlog"])
+
+    def get_job_diagnostics(self, jobid):
+        diag = {"id": jobid}
+        lookup_jobid = _lookup_jobid(jobid)
+
+        try:
+            diag["formatted_id"] = self.get_formatted_id(jobid)
+        except Exception as e:
+            diag["formatted_id_error"] = repr(e)
+
+        try:
+            diag["eventlog"] = self.get_eventlog(jobid)
+        except Exception as e:
+            diag["eventlog_error"] = repr(e)
+
+        try:
+            from flux.job.list import get_job
+            diag["job_info"] = _make_serializable(get_job(self._handle, lookup_jobid))
+        except Exception as e:
+            diag["job_info_error"] = repr(e)
+
+        try:
+            diag["kvs"] = _make_serializable(
+                flux.job.job_kvs_lookup(
+                    self._handle,
+                    lookup_jobid,
+                    keys=["jobspec", "R", "eventlog"],
+                )
+            )
+        except Exception as e:
+            diag["kvs_error"] = repr(e)
+
+        try:
+            diag.update(_make_serializable(modules.queue_status(self._handle)))
+        except Exception as e:
+            diag["queue_status_error"] = repr(e)
+
+        for key, method in (
+            ("qmanager_stats", "sched-fluxion-qmanager.stats-get"),
+            ("qmanager_params", "sched-fluxion-qmanager.params"),
+            ("resource_match_stats", "sched-fluxion-resource.stats-get"),
+        ):
+            try:
+                diag[key] = _make_serializable(self._handle.rpc(method).get())
+            except Exception as e:
+                diag[f"{key}_error"] = repr(e)
+
+        return diag
+
+    def check_jobspec_satisfiability(self, jobspec_json):
+        try:
+            jobspec_obj = json.loads(jobspec_json)
+        except Exception as e:
+            return {"error": "invalid jobspec JSON: {}".format(repr(e))}
+
+        attempts = []
+        for method in (
+            "sched-fluxion-resource.satisfiability",
+            "feasibility.check",
+        ):
+            try:
+                response = self._handle.rpc(
+                    method,
+                    {"jobspec": jobspec_obj},
+                ).get()
+                return {
+                    "satisfiable": True,
+                    "method": method,
+                    "response": _make_serializable(response),
+                }
+            except Exception as e:
+                attempts.append({"method": method, "error": repr(e)})
+
+        try:
+            response = self._handle.rpc(
+                "sched-fluxion-resource.match",
+                {
+                    "cmd": "satisfiability",
+                    "jobid": -1,
+                    "jobspec": jobspec_json,
+                },
+            ).get()
+            return {
+                "satisfiable": True,
+                "method": "sched-fluxion-resource.match",
+                "response": _make_serializable(response),
+                "attempts": attempts,
+            }
+        except Exception as e:
+            attempts.append({
+                "method": "sched-fluxion-resource.match",
+                "error": repr(e),
+            })
+
+        return {"satisfiable": None, "attempts": attempts}
     
     def get_formatted_id(self, job_id):
-        return flux.job.JobID(job_id).f58
+        try:
+            return flux.job.JobID(job_id).f58
+        except Exception:
+            return str(job_id)
 
     def nodelist_lookup(self, jobid) -> list[int]:
         if self._handle is not None:
-            nodes = stats.flux_nodelist_by_id(self._handle, jobid)
+            nodes = stats.flux_nodelist_by_id(self._handle, _lookup_jobid(jobid))
             return nodes, "flux_nodelist" if nodes else "missing"
         else:
             raise Exception("FluxAdapter.nodelist_lookup: flux handle is None")
@@ -158,3 +286,23 @@ def safe_then(cb):
             raise
     return _wrapped
 
+
+def _make_serializable(obj):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if is_dataclass(obj):
+        return _make_serializable(asdict(obj))
+    if isinstance(obj, dict):
+        return {str(k): _make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_make_serializable(v) for v in obj]
+    if hasattr(obj, "__dict__"):
+        return _make_serializable(vars(obj))
+    return str(obj)
+
+
+def _lookup_jobid(jobid):
+    try:
+        return int(jobid)
+    except Exception:
+        return int(flux.job.JobID(jobid))

@@ -31,6 +31,7 @@ class MockAdapter:
         self.simulation = None
         self._jobid_gen = itertools.count(1)
         self._free_nodes = 0
+        self._total_nodes = 0
         self._queue: deque[_QueuedJob] = deque()
         self._running: dict[int, _QueuedJob] = {}
 
@@ -50,9 +51,20 @@ class MockAdapter:
 
     def install_resources(self, cfg):
         '''Register emulated resources with the resource manager'''
-        self._free_nodes = cfg.nnodes
+        self._free_nodes = self.describe_resources(cfg)["nnodes"]
+        self._total_nodes = self._free_nodes
 
         return
+
+    def describe_resources(self, cfg):
+        return {
+            "source_path": None,
+            "nnodes": int(cfg.nnodes or 0),
+            "cores_per_node": int(cfg.ncpus or 1),
+            "gpus_per_node": int(cfg.ngpus or 0),
+            "jobspec_shape": {"intermediate_types": [], "intermediate_counts": {}},
+            "rabbit_storage": {},
+        }
 
     def reload_scheduler(self, cfg):
         '''Restart the scheduler and associated modules'''
@@ -101,20 +113,27 @@ class MockAdapter:
         else:
             raise TypeError(f"submit_job expected dict or JSON string, got {type(jobspec)!r}")
 
+        def count_resources(resources, target_type, multiplier=1):
+            total = 0
+            for resource in resources:
+                if not isinstance(resource, Mapping):
+                    continue
+                count = int(resource.get("count", 1))
+                current_multiplier = multiplier * count
+                if resource.get("type") == target_type:
+                    total += current_multiplier
+                children = resource.get("with", [])
+                if isinstance(children, list):
+                    total += count_resources(children, target_type, current_multiplier)
+            return total
+
         nnodes = 1
         try:
             resources = jobspec_obj.get("resources", [])
             if not isinstance(resources, list):
                 resources = []
 
-            node_res = None
-            for r in resources:
-                if isinstance(r, Mapping) and r.get("type") == "node":
-                    node_res = r
-                    break
-
-            if node_res is not None:
-                nnodes = int(node_res.get("count", 1))
+            nnodes = count_resources(resources, "node") or 1
         except Exception as e:
             logger.debug("MockAdapter: failed to parse nnodes from jobspec: %r", e)
             nnodes = 1
@@ -167,8 +186,73 @@ class MockAdapter:
 
     def get_eventlog(self, jobid):
         '''Get the eventlog for a job'''
-        eventlog = {'id': jobid, 'eventlog': '{"timestamp":1771624596.0322015,"name":"submit","context":{"userid":1000,"urgency":16,"flags":0,"version":1}}\n{"timestamp":1771624596.0427759,"name":"validate"}\n{"timestamp":1771624596.0531645,"name":"depend"}\n{"timestamp":1771624596.0532191,"name":"priority","context":{"priority":16}}\n{"timestamp":1771624596.0546091,"name":"alloc"}\n{"timestamp":1771624596.239527,"name":"start"}\n{"timestamp":1771624596.2398844,"name":"finish","context":{"status":0}}\n{"timestamp":1771624596.2399106,"name":"release","context":{"ranks":"all","final":true}}\n{"timestamp":1771624596.2399344,"name":"free"}\n{"timestamp":1771624596.2399468,"name":"clean"}\n'}
+        events = [
+            {"timestamp": 1771624596.0322015, "name": "submit", "context": {"userid": 1000, "urgency": 16, "flags": 0, "version": 1}},
+            {"timestamp": 1771624596.0427759, "name": "validate"},
+            {"timestamp": 1771624596.0531645, "name": "depend"},
+            {"timestamp": 1771624596.0532191, "name": "priority", "context": {"priority": 16}},
+        ]
+        queued = any(job.jobid == jobid for job in self._queue)
+        if jobid in self._running:
+            events.extend([
+                {"timestamp": 1771624596.0546091, "name": "alloc"},
+                {"timestamp": 1771624596.239527, "name": "start"},
+            ])
+        elif not queued:
+            events.extend([
+                {"timestamp": 1771624596.0546091, "name": "alloc"},
+                {"timestamp": 1771624596.239527, "name": "start"},
+                {"timestamp": 1771624596.2398844, "name": "finish", "context": {"status": 0}},
+                {"timestamp": 1771624596.2399106, "name": "release", "context": {"ranks": "all", "final": True}},
+                {"timestamp": 1771624596.2399344, "name": "free"},
+                {"timestamp": 1771624596.2399468, "name": "clean"},
+            ])
+        eventlog = {
+            "id": jobid,
+            "eventlog": "\n".join(json.dumps(event) for event in events) + "\n",
+        }
         return eventlog
+
+    def get_job_diagnostics(self, jobid):
+        queued = next((job for job in self._queue if job.jobid == jobid), None)
+        running = self._running.get(jobid)
+        job = queued or running
+        state = "running" if running else "queued" if queued else "unknown"
+        return {
+            "id": jobid,
+            "formatted_id": self.get_formatted_id(jobid),
+            "state": state,
+            "nnodes": job.nnodes if job else None,
+            "jobspec": job.jobspec if job else None,
+            "eventlog": self.get_eventlog(jobid),
+        }
+
+    def check_jobspec_satisfiability(self, jobspec_json):
+        try:
+            jobspec_obj = json.loads(jobspec_json)
+        except Exception as e:
+            return {"error": repr(e)}
+
+        def count_resources(resources, target_type, multiplier=1):
+            total = 0
+            for resource in resources:
+                if not isinstance(resource, Mapping):
+                    continue
+                count = int(resource.get("count", 1))
+                current_multiplier = multiplier * count
+                if resource.get("type") == target_type:
+                    total += current_multiplier
+                children = resource.get("with", [])
+                if isinstance(children, list):
+                    total += count_resources(children, target_type, current_multiplier)
+            return total
+
+        needed = count_resources(jobspec_obj.get("resources", []), "node")
+        return {
+            "satisfiable": needed <= self._total_nodes,
+            "node_count": needed,
+            "total_nodes": self._total_nodes,
+        }
 
     def get_formatted_id(self, job_id):
         '''Get the jobid in f58 format'''
