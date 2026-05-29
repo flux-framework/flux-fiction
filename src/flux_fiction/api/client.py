@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from flux_fiction._core import engine
 import flux_fiction.api.config as config
-from flux_fiction._adapters.flux.adapter import FluxAdapter
-from flux_fiction._adapters.mock.adapter import MockAdapter
 
 import logging
 logger = logging.getLogger(__name__)
@@ -32,10 +30,13 @@ def run_experiment(args: dict) -> engine.EngineResult:
     config.setup_logging(level=cfg.log_level, log_file=cfg.log_file, quiet=cfg.quiet)
 
     if cfg.backend == 'flux':
+        from flux_fiction._adapters.flux.adapter import FluxAdapter
         adapter = FluxAdapter()
     elif cfg.backend == 'mock':
+        from flux_fiction._adapters.mock.adapter import MockAdapter
         adapter = MockAdapter()
+    else:
+        raise ValueError(f"Unknown backend {cfg.backend!r}")
         
     logger.info(f"Running experiment with config: {cfg}")
     return engine.run(cfg, adapter)
-

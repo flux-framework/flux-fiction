@@ -1,4 +1,7 @@
 /build
+/builddir
+/.meson-*
+/dist
 job_transitions.csv
 /util/broker-logs.txt
 eventlog.csv

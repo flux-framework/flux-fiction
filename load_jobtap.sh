@@ -22,6 +22,9 @@ if [[ "${_load_jobtap_nounset}" -eq 1 ]]; then
 fi
 
 _load_jobtap_so="${FLUX_FICTION_JOBTAP_SO:-${_load_jobtap_dir}/build/emu-jobtap.so}"
+if [[ ! -f "${_load_jobtap_so}" ]] && command -v flux-fiction-jobtap-path >/dev/null 2>&1; then
+    _load_jobtap_so="$(flux-fiction-jobtap-path)"
+fi
 if [[ ! -f "${_load_jobtap_so}" ]]; then
     echo "ERROR: jobtap plugin not found: ${_load_jobtap_so}" >&2
     return 1 2>/dev/null || exit 1

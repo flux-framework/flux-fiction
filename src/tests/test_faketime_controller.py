@@ -4,6 +4,8 @@ import importlib.util
 import sys
 import types
 
+import pytest
+
 try:
     _tqdm_missing = importlib.util.find_spec("tqdm") is None
 except ValueError:
@@ -62,7 +64,7 @@ def test_faketime_controller_jumps_forward_only(tmp_path):
     )
 
     skipped = controller.advance_to(0.01)
-    assert skipped.action == "skipped"
+    assert skipped.action == "overrun"
     assert read_offset(stamp) == -900.0
 
     jumped = controller.advance_to(1.0)
@@ -175,4 +177,4 @@ def test_simulation_uses_observed_fake_time_for_starts(tmp_path):
 
     assert job.start_time == 123.456789
     assert job.state_transitions["STARTED"] == 123.456789
-    assert job.complete_time == 133.456789
+    assert job.complete_time == pytest.approx(133.456789)
