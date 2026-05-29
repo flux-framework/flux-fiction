@@ -8,6 +8,10 @@ eventlog.csv
 /src/python/variations*
 /util/*.txt
 *.log
+.DS_Store
+**/.DS_Store
 *__pycache__/
 src/*.csv
 src/*.json
+/experiment_data/
+/test/

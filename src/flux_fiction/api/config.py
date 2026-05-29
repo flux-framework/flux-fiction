@@ -6,7 +6,15 @@ import logging
 import sys
 import os
 from pathlib import Path
-from pydantic import BaseModel, Field, model_validator, ValidationError, ConfigDict
+from pydantic import BaseModel, Field, ValidationError
+
+try:
+    from pydantic import ConfigDict, model_validator
+    _PYDANTIC_V2 = True
+except ImportError:
+    from pydantic import root_validator
+    ConfigDict = None
+    _PYDANTIC_V2 = False
 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +28,33 @@ _PATH_FIELDS = {
     "output_dir": True,
     "log_file": True,
     "faketime_timestamp_file": True,
+    "otel_bridge_socket": True,
+    "otel_summary_file": True,
+    "otel_spans_file": True,
+    "otel_bridge_log_file": True,
 }
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _workspace_root() -> Path:
+    override = os.environ.get("FLUX_FICTION_WORKSPACE_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return _repo_root().parent
+
+
+def _legacy_prefixes() -> list[tuple[str, str]]:
+    repo_root = _repo_root()
+    workspace_root = _workspace_root()
+    return [
+        ("/home/j/Desktop/flux/sc25_poster/flux-fiction", str(repo_root)),
+        ("/home/j/Desktop/flux/sc25_poster", str(workspace_root)),
+        ("/work/flux/sc25_poster/flux-fiction", str(repo_root)),
+        ("/work/flux/sc25_poster", str(workspace_root)),
+    ]
 
 
 def _parse_path_map_entry(entry: str) -> tuple[str, str]:
@@ -47,11 +81,7 @@ def _path_mappings() -> list[tuple[str, str]]:
         if entry:
             mappings.append(_parse_path_map_entry(entry))
 
-    # Common host/container mount used by the Flux Fiction dev container.
-    if Path("/work/flux").exists():
-        mappings.append(("/home/j/Desktop/flux", "/work/flux"))
-    if Path("/home/j/Desktop/flux").exists():
-        mappings.append(("/work/flux", "/home/j/Desktop/flux"))
+    mappings.extend(_legacy_prefixes())
 
     # Prefer the longest prefix when multiple mappings could match.
     return sorted(dict.fromkeys(mappings), key=lambda item: len(item[0]), reverse=True)
@@ -127,9 +157,20 @@ class ExperimentConfig:
     faketime_seed: bool = True
     faketime_tolerance: float = 1e-6
     faketime_near_event_threshold: float = 0.0
+    otel_enabled: bool = False
+    otel_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    otel_service_name: str = "flux-fiction"
+    otel_bridge_socket: Optional[str] = None
+    otel_summary_file: Optional[str] = None
+    otel_spans_file: Optional[str] = None
+    otel_bridge_log_file: Optional[str] = None
 
 class ExperimentConfigModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="forbid")
+    else:
+        class Config:
+            extra = "forbid"
 
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
@@ -163,29 +204,55 @@ class ExperimentConfigModel(BaseModel):
     faketime_seed: bool = True
     faketime_tolerance: float = Field(default=1e-6, ge=0)
     faketime_near_event_threshold: float = Field(default=0.0, ge=0)
+    otel_enabled: bool = False
+    otel_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    otel_service_name: str = "flux-fiction"
+    otel_bridge_socket: Optional[str] = None
+    otel_summary_file: Optional[str] = None
+    otel_spans_file: Optional[str] = None
+    otel_bridge_log_file: Optional[str] = None
 
-    @model_validator(mode="after")
-    def _checks(self):
-        if self.resource_file and self.resource_R:
-            raise ValueError("Use only one of resource_file or resource_R.")
-        if self.job_traces is None and self.config_file is None:
-            raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
-        if self.backend != "flux" and self.backend != "mock":
-            raise ValueError("Backend must be set to either flux or mock.")
-        if self.output_dir[-1] != '/':
-            self.output_dir = self.output_dir + '/'
-        return self
+    if _PYDANTIC_V2:
+        @model_validator(mode="after")
+        def _checks(self):
+            if self.resource_file and self.resource_R:
+                raise ValueError("Use only one of resource_file or resource_R.")
+            if self.job_traces is None and self.config_file is None:
+                raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
+            if self.backend != "flux" and self.backend != "mock":
+                raise ValueError("Backend must be set to either flux or mock.")
+            if self.output_dir[-1] != '/':
+                self.output_dir = self.output_dir + '/'
+            return self
+    else:
+        @root_validator(skip_on_failure=True)
+        def _checks(cls, values):
+            if values.get("resource_file") and values.get("resource_R"):
+                raise ValueError("Use only one of resource_file or resource_R.")
+            if values.get("job_traces") is None and values.get("config_file") is None:
+                raise ValueError("No job_traces input. Provide job_traces (or set it in TOML).")
+            if values.get("backend") not in {"flux", "mock"}:
+                raise ValueError("Backend must be set to either flux or mock.")
+            output_dir = values.get("output_dir")
+            if output_dir and output_dir[-1] != '/':
+                values["output_dir"] = output_dir + '/'
+            return values
 
 def _to_dataclass(data: dict) -> ExperimentConfig:
     try:
         data = {k: v for k, v in data.items() if v is not None}
         data = _normalize_config_paths(data)
-        m = ExperimentConfigModel.model_validate(data)
+        if _PYDANTIC_V2:
+            m = ExperimentConfigModel.model_validate(data)
+            model_data = m.model_dump()
+        else:
+            m = ExperimentConfigModel.parse_obj(data)
+            model_data = m.dict()
     except ValidationError as e:
         # make CLI/TOML errors readable
         raise ValueError(str(e)) from e
 
-    return ExperimentConfig(**m.model_dump())
+    return ExperimentConfig(**model_data)
 
 def _load_toml(path: str) -> dict:
     if not os.path.exists(path):
@@ -245,6 +312,13 @@ def from_toml(args: dict) -> ExperimentConfig:
         "faketime_near_event_threshold",
         "account_system_latency",
         "jobtap_logging",
+        "otel_enabled",
+        "otel_endpoint",
+        "otel_service_name",
+        "otel_bridge_socket",
+        "otel_summary_file",
+        "otel_spans_file",
+        "otel_bridge_log_file",
     ]
     for key in cli_overrides:
         value = getattr(args, key, None) if not isinstance(args, dict) else args.get(key)
@@ -254,11 +328,16 @@ def from_toml(args: dict) -> ExperimentConfig:
     merged = _normalize_config_paths(merged)
 
     try:
-        model = ExperimentConfigModel.model_validate(merged)
+        if _PYDANTIC_V2:
+            model = ExperimentConfigModel.model_validate(merged)
+            model_data = model.model_dump()
+        else:
+            model = ExperimentConfigModel.parse_obj(merged)
+            model_data = model.dict()
     except ValidationError as e:
         raise ValueError(f"Invalid TOML config in {cfg_path}:\n{e}") from e
 
-    return ExperimentConfig(**model.model_dump())
+    return ExperimentConfig(**model_data)
     
 
 def from_cli_args(args) -> ExperimentConfig:

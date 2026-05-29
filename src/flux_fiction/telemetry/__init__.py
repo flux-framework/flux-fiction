@@ -1,1 +1,1 @@
-from .telemetry import get_tracer
+from .client import TelemetryClient

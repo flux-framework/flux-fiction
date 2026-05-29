@@ -4,7 +4,12 @@ import importlib.util
 import sys
 import types
 
-if importlib.util.find_spec("tqdm") is None:
+try:
+    _tqdm_missing = importlib.util.find_spec("tqdm") is None
+except ValueError:
+    _tqdm_missing = "tqdm" not in sys.modules
+
+if _tqdm_missing:
     tqdm_stub = types.ModuleType("tqdm")
     tqdm_stub.tqdm = lambda *args, **kwargs: None
     sys.modules["tqdm"] = tqdm_stub
@@ -111,6 +116,9 @@ def test_simulation_advances_faketime_before_event_callbacks(tmp_path):
     class Adapter:
         def get_kvs_stats(self):
             return {}
+
+        def accumulate_quiescent(self, payload):
+            calls.append(("accumulate", payload))
 
         def query_quiescent(self, payload, return_cb):
             calls.append(("quiescent", payload))

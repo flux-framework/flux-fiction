@@ -47,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--faketime_near_event_threshold", "--faketime-near-event-threshold", dest="faketime_near_event_threshold", type=float, default=None, help="If the next event is this many seconds or less away in fake time, wait naturally instead of jumping.")
     parser.add_argument("--faketime_seed", "--faketime-seed", dest="faketime_seed", action="store_true", default=None, help="Seed the faketime timestamp file at startup.")
     parser.add_argument("--faketime_no_seed", "--faketime-no-seed", dest="faketime_seed", action="store_false", help="Do not seed the faketime timestamp file at startup; require an existing relative offset.")
+    parser.set_defaults(otel_enabled=None)
+    parser.add_argument("--otel", "--otel-enabled", dest="otel_enabled", action="store_true", help="Enable profiling through the out-of-process OpenTelemetry bridge.")
+    parser.add_argument("--no-otel", "--otel-disabled", dest="otel_enabled", action="store_false", help="Disable profiling through the out-of-process OpenTelemetry bridge.")
+    parser.add_argument("--otel-endpoint", dest="otel_endpoint", type=str, default=None, help="OTLP HTTP trace endpoint used by the bridge process.")
+    parser.add_argument("--otel-service-name", dest="otel_service_name", type=str, default=None, help="Base OpenTelemetry service name for Flux Fiction profiling.")
+    parser.add_argument("--otel-bridge-socket", dest="otel_bridge_socket", type=str, default=None, help="Unix datagram socket path used by profiled processes to talk to the bridge.")
+    parser.add_argument("--otel-summary-file", dest="otel_summary_file", type=str, default=None, help="Optional profiling summary output path written by the bridge.")
+    parser.add_argument("--otel-spans-file", dest="otel_spans_file", type=str, default=None, help="Optional JSONL span dump path written by the bridge.")
+    parser.add_argument("--otel-bridge-log-file", dest="otel_bridge_log_file", type=str, default=None, help="Optional log file for the bridge process.")
 
     return parser
 

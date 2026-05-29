@@ -78,6 +78,9 @@ def reset_jobtap_plugin(
     keep_timestep=False,
     batch_job_starts=True,
     log_enabled=False,
+    otel_enabled=False,
+    otel_socket=None,
+    otel_service_name="flux-fiction-jobtap",
 ):
     try:
         flux_handle.rpc(
@@ -86,12 +89,16 @@ def reset_jobtap_plugin(
                 "keep_timestep": keep_timestep,
                 "batch_job_starts": batch_job_starts,
                 "log_enabled": log_enabled,
+                "otel_enabled": otel_enabled,
+                "otel_socket": otel_socket,
+                "otel_service_name": otel_service_name,
             },
         ).get()
         logger.debug(
-            "Reset emu-jobtap probe to defaults (batch_job_starts=%s, log_enabled=%s)",
+            "Reset emu-jobtap probe to defaults (batch_job_starts=%s, log_enabled=%s, otel_enabled=%s)",
             batch_job_starts,
             log_enabled,
+            otel_enabled,
         )
     except Exception as e:
         logger.error(f"Failed to reset emu-jobtap probe: {e}")

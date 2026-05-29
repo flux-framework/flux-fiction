@@ -15,10 +15,11 @@ set(FLUX_INSTALL_PREFIX "" CACHE PATH
 
 # Prepare search paths for system install
 set(_SYS_INCLUDE_PATHS /usr/include /usr/local/include)
-set(_SYS_LIB_PATHS     /usr/lib     /usr/local/lib)
+set(_SYS_LIB_PATHS     /usr/lib     /usr/local/lib /usr/lib64 /usr/local/lib64)
 if(FLUX_INSTALL_PREFIX)
     list(APPEND _SYS_INCLUDE_PATHS "${FLUX_INSTALL_PREFIX}/include")
     list(APPEND _SYS_LIB_PATHS     "${FLUX_INSTALL_PREFIX}/lib")
+    list(APPEND _SYS_LIB_PATHS     "${FLUX_INSTALL_PREFIX}/lib64")
 endif()
 
 # Try to find system install
@@ -64,7 +65,8 @@ link_directories(${FLUX_LIB_DIR})
 # Build the jobtap plugin
 set(JOBTAP_SRC_DIR "${CMAKE_SOURCE_DIR}/src/jobtap")
 add_library(emu_jobtap SHARED
-    ${JOBTAP_SRC_DIR}/emu-jobtap.c)
+    ${JOBTAP_SRC_DIR}/emu-jobtap.c
+    ${JOBTAP_SRC_DIR}/ff_otel.c)
 target_compile_options(emu_jobtap PRIVATE -Wall -Wextra)
 target_link_libraries(emu_jobtap
   PRIVATE

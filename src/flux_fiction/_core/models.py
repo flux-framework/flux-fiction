@@ -103,7 +103,9 @@ class Job(object):
         self.rabbit_storage_nodes_per_parent = 0
         self.rabbit_storage_shares_per_parent = 0
         self.rabbit_storage_share_gib = 0.0
+        self.rabbit_storage_parent_gib = 0.0
         self.rabbit_storage_share_count = 0
+        self.rabbit_storage_request_count = 0
         self.rabbit_storage_emit_dw = False
         self.rabbit_storage_name = "rabbit"
 
@@ -173,27 +175,32 @@ class Job(object):
 
 
     def _resource_sections_with_rabbit_storage(self, node_section):
-        if self.rabbit_storage_share_count <= 0:
+        if self.rabbit_storage_request_count <= 0:
             return [node_section]
 
         ssd_section = create_resource(
             self.rabbit_storage_resource_type,
-            int(self.rabbit_storage_share_count),
+            int(self.rabbit_storage_request_count),
         )
         ssd_section["exclusive"] = True
         if not self.rabbit_storage_parent_type:
             return [node_section, ssd_section]
 
         nodes_per_parent = int(self.rabbit_storage_nodes_per_parent or self.nnodes or 1)
-        shares_per_parent = int(self.rabbit_storage_shares_per_parent or self.rabbit_storage_share_count or 1)
+        storage_per_parent = float(
+            self.rabbit_storage_parent_gib
+            or (self.rabbit_storage_shares_per_parent * self.rabbit_storage_share_gib)
+            or self.rabbit_storage_request_count
+            or 1
+        )
         parent_count = max(
             1,
             math.ceil(self.nnodes / nodes_per_parent),
-            math.ceil(self.rabbit_storage_share_count / shares_per_parent),
+            math.ceil(self.rabbit_storage_request_count / storage_per_parent),
         )
         node_section = dict(node_section)
         node_section["count"] = max(1, math.ceil(self.nnodes / parent_count))
-        ssd_section["count"] = max(1, math.ceil(self.rabbit_storage_share_count / parent_count))
+        ssd_section["count"] = max(1, math.ceil(self.rabbit_storage_request_count / parent_count))
 
         return [create_resource(
             self.rabbit_storage_parent_type,
@@ -223,6 +230,14 @@ class Job(object):
         self.rabbit_storage_nodes_per_parent = int(storage.get("nodes_per_parent") or 0)
         self.rabbit_storage_shares_per_parent = int(storage.get("shares_per_parent") or 0)
         self.rabbit_storage_share_gib = float(storage.get("share_gib") or 0.0)
+        self.rabbit_storage_parent_gib = float(
+            storage.get("max_parent_gib")
+            or (
+                float(storage.get("shares_per_parent") or 0)
+                * float(storage.get("share_gib") or 0)
+            )
+            or 0.0
+        )
         self.rabbit_storage_emit_dw = bool(emit_dw)
         self.rabbit_storage_name = str(name or "rabbit")
         if self.rabbit_storage_gib > 0 and self.rabbit_storage_share_gib > 0:
@@ -231,6 +246,11 @@ class Job(object):
             )
         else:
             self.rabbit_storage_share_count = 0
+        self.rabbit_storage_request_count = (
+            math.ceil(self.rabbit_storage_gib)
+            if self.rabbit_storage_gib > 0
+            else 0
+        )
         self._jobspec = None
 
 
@@ -251,7 +271,7 @@ class Job(object):
             details = (
                 "trace_idx={trace_idx} nnodes={nnodes} ncpus={ncpus} "
                 "ngpus={ngpus} rabbit_storage_gib={rabbit_gib:.3f} "
-                "rabbit_shares={rabbit_shares}"
+                "rabbit_shares={rabbit_shares} rabbit_request_count={rabbit_request_count}"
             ).format(
                 trace_idx=self.trace_index,
                 nnodes=self.nnodes,
@@ -259,6 +279,7 @@ class Job(object):
                 ngpus=self.ngpus,
                 rabbit_gib=self.rabbit_storage_gib,
                 rabbit_shares=self.rabbit_storage_share_count,
+                rabbit_request_count=self.rabbit_storage_request_count,
             )
             raise RuntimeError(
                 "Job submit failed for {}: {}\nJobspec JSON:\n{}"

@@ -34,6 +34,9 @@ class FluxAdapter:
             keep_timestep=False,
             batch_job_starts=self.simulation.batch_job_starts,
             log_enabled=self.simulation.jobtap_logging,
+            otel_enabled=self.simulation.otel_enabled,
+            otel_socket=self.simulation.otel_bridge_socket,
+            otel_service_name=self.simulation.otel_service_name + "-jobtap",
         )
 
     def close(self) -> None:
@@ -50,6 +53,9 @@ class FluxAdapter:
             keep_timestep=False,
             batch_job_starts=True,
             log_enabled=False,
+            otel_enabled=False,
+            otel_socket=None,
+            otel_service_name="flux-fiction-jobtap",
         )
         if self._watchers is not None:
             watchers.teardown_watchers(self._handle, self._watchers, self._services or set())
@@ -140,6 +146,16 @@ class FluxAdapter:
                 payload=json_string).then(safe_then(return_cb), arg=None)
         except Exception as e:
             raise RuntimeError("Failed to query quiescent") from e
+
+    def accumulate_quiescent(self, json_string):
+        logger.debug("Accumulating quiescent expectations")
+        try:
+            self._handle.rpc(
+                "job-manager.emu-jobtap.accumulate",
+                payload=json_string,
+            ).get()
+        except Exception as e:
+            raise RuntimeError("Failed to accumulate quiescent expectations") from e
           
     
     def get_eventlog(self, jobid):

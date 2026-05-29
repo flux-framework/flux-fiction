@@ -42,6 +42,8 @@ class MockAdapter:
 
         self._deferred: deque[Callable[[], None]] = deque()
         self._reactor_running = False
+        self.accumulated_quiescent_payloads: list[dict[str, Any]] = []
+        self.quiescent_payloads: list[dict[str, Any]] = []
 
     def open(self, simulation) -> None:
         self.simulation = simulation
@@ -174,6 +176,16 @@ class MockAdapter:
         if self.simulation is None:
             raise RuntimeError("MockAdapter not opened with a simulation")
 
+        payload = {}
+        if isinstance(json_string_or_payload, str):
+            try:
+                payload = json.loads(json_string_or_payload)
+            except Exception:
+                payload = {"raw": json_string_or_payload}
+        elif isinstance(json_string_or_payload, Mapping):
+            payload = dict(json_string_or_payload)
+        self.quiescent_payloads.append(payload)
+
         def _cont():
             # schedule starts and flush them
             jobids = self._try_schedule()
@@ -183,6 +195,17 @@ class MockAdapter:
             return_cb(None, None)
 
         self._deferred.append(_cont)
+
+    def accumulate_quiescent(self, json_string_or_payload):
+        payload = {}
+        if isinstance(json_string_or_payload, str):
+            try:
+                payload = json.loads(json_string_or_payload)
+            except Exception:
+                payload = {"raw": json_string_or_payload}
+        elif isinstance(json_string_or_payload, Mapping):
+            payload = dict(json_string_or_payload)
+        self.accumulated_quiescent_payloads.append(payload)
 
     def get_eventlog(self, jobid):
         '''Get the eventlog for a job'''

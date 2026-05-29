@@ -100,18 +100,31 @@ def _resource_capacities(resource_desc: dict[str, Any]) -> dict[str, float]:
     for resource_type, facts in leaf_resources.items():
         if resource_type in IGNORED_RESOURCE_TYPES:
             continue
-        count = _as_float(facts.get("count") if isinstance(facts, dict) else facts)
+        if (
+            isinstance(facts, dict)
+            and resource_type in STORAGE_RESOURCE_TYPES
+            and _as_float(facts.get("size")) > 0
+        ):
+            count = _as_float(facts.get("size"))
+        else:
+            count = _as_float(facts.get("count") if isinstance(facts, dict) else facts)
         if count > 0:
             capacities[str(resource_type)] = count
 
     rabbit = resource_desc.get("rabbit_storage") or {}
-    rabbit_shares = (
-        int(rabbit.get("parent_count") or 0)
-        * int(rabbit.get("shares_per_parent") or 0)
+    rabbit_capacity_gib = float(
+        rabbit.get("parent_count") or 0
+    ) * float(
+        rabbit.get("max_parent_gib")
+        or (
+            float(rabbit.get("shares_per_parent") or 0)
+            * float(rabbit.get("share_gib") or 0)
+        )
+        or 0
     )
     rabbit_type = str(rabbit.get("resource_type") or "ssd")
-    if rabbit_shares > 0:
-        capacities[rabbit_type] = float(rabbit_shares)
+    if rabbit_capacity_gib > 0 and rabbit_type not in capacities:
+        capacities[rabbit_type] = rabbit_capacity_gib
 
     return {
         key: value
@@ -251,7 +264,7 @@ def _jobspec_resource_counts(jobspec: dict[str, Any]) -> dict[str, float]:
 
 def _job_specific_resource_count(job, resource_type: str) -> float:
     if resource_type == getattr(job, "rabbit_storage_resource_type", None):
-        return float(getattr(job, "rabbit_storage_share_count", 0) or 0)
+        return float(getattr(job, "rabbit_storage_request_count", 0) or 0)
     return 0.0
 
 
@@ -685,8 +698,8 @@ def _display_name(resource_type: str) -> str:
 
 
 def _hour_unit(resource_type: str) -> str:
-    if resource_type == "ssd":
-        return "Share-Hours"
+    if resource_type in STORAGE_RESOURCE_TYPES:
+        return "GiB-Hours"
     return "Hours"
 
 
