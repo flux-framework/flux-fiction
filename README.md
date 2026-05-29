@@ -16,12 +16,12 @@ project. Arrange sibling checkouts like this:
   flux-core/
   flux-sched/
   flux-fiction/
-  podman_containers/
 ```
 
-Build the dev image from `podman_containers/`:
+Build the dev image from `flux-fiction/podman_containers/`:
 
 ```bash
+cd flux-fiction/podman_containers
 ./build_container.sh flux-fiction-dev
 ```
 

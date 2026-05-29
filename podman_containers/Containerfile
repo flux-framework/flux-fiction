@@ -1,0 +1,216 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LC_ALL=C
+ENV LANG=C
+ENV PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+ENV CC=gcc-12
+ENV CXX=g++-12
+
+RUN apt-get update && \
+    apt-get install -y \
+        autoconf \
+        automake \
+        libtool \
+        build-essential \
+        make \
+        cmake \
+        meson \
+        ninja-build \
+        pkg-config \
+        gcc \
+        g++ \
+        gcc-12 \
+        g++-12 \
+        cpp-12 \
+        gfortran \
+        git \
+        wget \
+        curl \
+        vim \
+        less \
+        file \
+        jq \
+        ca-certificates \
+        time \
+        valgrind \
+        aspell \
+        aspell-en \
+        fakeroot \
+        libfaketime \
+        libc6-dev \
+        libzmq3-dev \
+        uuid-dev \
+        libjansson-dev \
+        liblz4-dev \
+        libarchive-dev \
+        libhwloc-dev \
+        libsqlite3-dev \
+        lua5.1 \
+        liblua5.1-dev \
+        lua-posix \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        python3-cffi \
+        python3-ply \
+        python3-setuptools \
+        python3-yaml \
+        python3-sphinx \
+        python3-wheel \
+        python3-pytest \
+        python3-pytest-cov \
+        python3-matplotlib \
+        python3-tqdm \
+        python3-pydantic \
+        python3-tomli \
+        python3-jsonschema \
+        libmpich-dev \
+        libboost-dev \
+        libboost-graph-dev \
+        libedit-dev \
+        libyaml-cpp-dev \
+        tmux \
+        strace && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --break-system-packages \
+        build \
+        meson-python \
+        opentelemetry-api \
+        opentelemetry-sdk \
+        opentelemetry-exporter-otlp-proto-http
+
+RUN mkdir -p /work /data /output /scratch
+
+RUN cat > /usr/local/bin/flux-dev-env.sh <<'EOF'
+#!/bin/bash
+git config --global --add safe.directory /workspace/flux-core >/dev/null 2>&1 || true
+git config --global --add safe.directory /workspace/flux-sched >/dev/null 2>&1 || true
+git config --global --add safe.directory /workspace/flux-fiction >/dev/null 2>&1 || true
+export FLUX_PREFIX=/workspace/container-installs/flux-core
+export PATH="$FLUX_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CC=gcc-12
+export CXX=g++-12
+
+if command -v flux >/dev/null 2>&1; then
+    eval "$(flux env)" 2>/dev/null || true
+fi
+EOF
+
+RUN chmod +x /usr/local/bin/flux-dev-env.sh
+
+RUN cat > /usr/local/bin/build-flux-core.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export SRC_ROOT=/workspace
+export INSTALL_ROOT="$SRC_ROOT/container-installs"
+export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
+
+git config --global --add safe.directory "$SRC_ROOT/flux-core" >/dev/null 2>&1 || true
+mkdir -p "$INSTALL_ROOT/flux-core"
+
+cd "$SRC_ROOT/flux-core"
+make distclean || true
+./autogen.sh
+CC=gcc-12 CXX=g++-12 ./configure --prefix="$FLUX_PREFIX"
+make -j"$(nproc)"
+make install
+
+echo
+echo "flux-core installed to: $FLUX_PREFIX"
+EOF
+
+RUN cat > /usr/local/bin/build-flux-sched.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export SRC_ROOT=/workspace
+export INSTALL_ROOT="$SRC_ROOT/container-installs"
+export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
+
+git config --global --add safe.directory "$SRC_ROOT/flux-sched" >/dev/null 2>&1 || true
+export PATH="$FLUX_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+if [ -z "${FLUX_SCHED_VERSION:-}" ]; then
+  FLUX_SCHED_GIT_VERSION="$(cd "$SRC_ROOT/flux-sched" && git describe --tags --always 2>/dev/null || true)"
+  case "$FLUX_SCHED_GIT_VERSION" in
+    ''|*[!0-9.]*)
+      export FLUX_SCHED_VERSION=0.0.0
+      ;;
+    *)
+      export FLUX_SCHED_VERSION="${FLUX_SCHED_GIT_VERSION#v}"
+      ;;
+  esac
+fi
+
+cd "$SRC_ROOT/flux-sched"
+rm -rf build
+mkdir -p build
+cd build
+CC=gcc-12 CXX=g++-12 cmake .. \
+  -DCMAKE_INSTALL_PREFIX="$FLUX_PREFIX" \
+  -DCMAKE_PREFIX_PATH="$FLUX_PREFIX"
+make -j"$(nproc)"
+make install
+
+echo
+echo "flux-sched installed to: $FLUX_PREFIX"
+EOF
+
+RUN cat > /usr/local/bin/build-flux-fiction.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export SRC_ROOT=/workspace
+export INSTALL_ROOT="$SRC_ROOT/container-installs"
+export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
+
+git config --global --add safe.directory "$SRC_ROOT/flux-fiction" >/dev/null 2>&1 || true
+export PATH="$FLUX_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+cd "$SRC_ROOT/flux-fiction"
+python3 -m pip install --break-system-packages --no-deps -e .
+
+echo
+echo "flux-fiction installed in editable mode"
+echo "CLI commands: flux-fiction, flux-fiction-run, flux-fiction-jobtap-path"
+EOF
+
+RUN cat > /usr/local/bin/build-flux-stack.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+/usr/local/bin/build-flux-core.sh
+/usr/local/bin/build-flux-sched.sh
+/usr/local/bin/build-flux-fiction.sh
+
+echo
+echo "Build complete."
+EOF
+
+RUN chmod +x \
+    /usr/local/bin/build-flux-core.sh \
+    /usr/local/bin/build-flux-sched.sh \
+    /usr/local/bin/build-flux-fiction.sh \
+    /usr/local/bin/build-flux-stack.sh
+
+RUN cat > /etc/profile.d/flux-dev.sh <<'EOF'
+source /usr/local/bin/flux-dev-env.sh
+
+alias rebuild-flux-core='/usr/local/bin/build-flux-core.sh'
+alias rebuild-flux-sched='/usr/local/bin/build-flux-sched.sh'
+alias rebuild-flux-fiction='/usr/local/bin/build-flux-fiction.sh'
+alias rebuild-flux-stack='/usr/local/bin/build-flux-stack.sh'
+EOF
+
+CMD ["/bin/bash", "-l"]
