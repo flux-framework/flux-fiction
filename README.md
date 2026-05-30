@@ -1,4 +1,6 @@
-![Flux Fiction Logo](assets/ff_logo.png)
+<p align="center">
+  <img src="assets/ff_logo.png" alt="Flux Fiction Logo" width="220">
+</p>
 
 # Flux Fiction
 
