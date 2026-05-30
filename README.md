@@ -1,15 +1,24 @@
-# flux-fiction
+![Flux Fiction Logo](assets/ff_logo.png)
 
-This repo contains Flux Fiction, a tool designed to test scheduling policies in Flux without impacting production systems. The emulator plugs into the real components of Flux and Fluxion to mimic job execution, emulate resource usage, and collect information on how the jobs are treated by Flux. 
+# Flux Fiction
 
-## Build And Install
+Flux Fiction is a trace-driven emulator for experimenting with Flux scheduling
+policies without touching a production system. It plugs into real Flux and
+Fluxion components, submits emulated jobs, tracks their lifecycle, and writes
+artifacts that help you study scheduling behavior, resource use, and timing.
 
-Flux Fiction now uses a standard `pyproject.toml` and Meson-based native build.
+## What It Does
 
-### Fresh Clone
+- Replays historical or synthetic workloads against a real Flux instance.
+- Uses a native jobtap plugin to emulate job execution and timing.
+- Produces run directories with logs, transition tables, resource timelines,
+  utilization plots, and trace-style outputs.
+- Supports optional faketime-driven simulation control and OpenTelemetry
+  profiling.
 
-The recommended first-time setup is the shared Podman workspace used by this
-project. Arrange sibling checkouts like this:
+## Quickstart
+
+The recommended setup is a shared workspace with sibling checkouts:
 
 ```text
 <workspace>/
@@ -18,21 +27,22 @@ project. Arrange sibling checkouts like this:
   flux-fiction/
 ```
 
-Build the dev image from `flux-fiction/podman_containers/`:
+### 1. Build The Dev Image
 
 ```bash
 cd flux-fiction/podman_containers
 ./build_container.sh flux-fiction-dev
 ```
 
-Start the container with the whole workspace mounted at `/workspace`:
+### 2. Start The Container
+
+From the workspace parent directory:
 
 ```bash
-cd ..
 podman run --rm -it -v "$(pwd)":/workspace flux-fiction-dev
 ```
 
-Inside the container:
+### 3. Build And Install Inside The Container
 
 ```bash
 source /usr/local/bin/flux-dev-env.sh
@@ -41,51 +51,112 @@ source /usr/local/bin/flux-dev-env.sh
 /usr/local/bin/build-flux-fiction.sh
 ```
 
-That last step performs an editable install of `flux-fiction`, builds the
-native jobtap plugin through Meson, and makes these commands available:
+This gives you an editable install of `flux-fiction` and the main CLI commands:
 
 - `flux-fiction`
 - `flux-fiction-run`
 - `flux-fiction-jobtap-path`
 
-Run a smoke test:
+### 4. Run A Smoke Test
 
 ```bash
 cd /workspace/flux-fiction
 flux-fiction-run test/simple_test/config.toml --tag smoke --no-faketime
 ```
 
-Run Python tests:
+### 5. Run Tests
 
 ```bash
 cd /workspace/flux-fiction
 pytest -q
 ```
 
-### Python package
+## Main Commands
 
-Install for development:
+Use the base CLI when you already have a config and environment prepared:
+
+```bash
+flux-fiction --config_file /path/to/config.toml
+```
+
+Use the harness when you want Flux Fiction to prepare a run directory, copy
+config inputs, wire faketime, and launch a fresh Flux instance:
+
+```bash
+flux-fiction-run /path/to/config.toml
+```
+
+Locate the built or installed jobtap plugin:
+
+```bash
+flux-fiction-jobtap-path
+```
+
+## Dependencies
+
+### Python Package Dependencies
+
+Declared in `pyproject.toml`:
+
+- `pydantic`
+- `tqdm`
+
+Optional extras:
+
+- `dev`: `build`, `meson`, `meson-python`, `pytest`, `pytest-cov`
+- `plot`: `matplotlib`
+- `otel`: `opentelemetry-api`, `opentelemetry-sdk`,
+  `opentelemetry-exporter-otlp-proto-http`
+
+### Native And System Dependencies
+
+Required to build and run the jobtap plugin and the full simulator stack:
+
+- `flux-core` headers and libraries
+- `flux-sched`
+- `jansson`
+- `meson`
+- `ninja`
+- `pkg-config`
+- `gcc` / `g++`
+- `cmake`
+- `python3`, `pip`, and Python development headers
+
+### Dev Container Dependencies
+
+The Podman dev image additionally includes tooling commonly needed for local
+development and CI setup:
+
+- `pytest`
+- `pytest-cov`
+- `matplotlib`
+- `meson-python`
+- `build`
+- OpenTelemetry Python packages
+- debugging and build tools such as `gdb`, `valgrind`, `strace`, `tmux`
+
+## Local Python Install
+
+If you already have Flux and the native build dependencies available on your
+system, you can install directly from the repo.
+
+### Development Install
 
 ```bash
 python3 -m pip install -e '.[dev]'
 ```
 
-Install optional extras when needed:
+### Install With Plotting And OTel Extras
 
 ```bash
 python3 -m pip install -e '.[dev,plot,otel]'
 ```
 
-This installs the `flux-fiction` console entry point and the
-`flux-fiction-jobtap-path` helper used to locate the bundled `emu-jobtap.so`
-plugin.
+## Native Build
 
-### Native plugin build
+Flux Fiction uses Meson for the native `emu-jobtap.so` build.
 
-The `emu-jobtap.so` plugin is built by Meson and installed into the Python
-package under `flux_fiction/_native/`.
-
-Direct Meson build:
+### Direct Meson Build
 
 ```bash
 meson setup builddir
@@ -93,7 +164,7 @@ meson compile -C builddir
 meson install -C builddir
 ```
 
-If `flux-core` is not in a standard system prefix, point Meson at the install:
+### Point Meson At A Flux Install
 
 ```bash
 meson setup builddir -Dflux_prefix=/path/to/flux-core
@@ -105,36 +176,61 @@ automatically try:
 - `../container-installs/flux-core`
 - `../flux-core`
 
-### Runtime dependencies
+## Outputs
 
-The Python package declares pure-Python dependencies in `pyproject.toml`.
-System-level dependencies for the native jobtap plugin still need to be present,
-including:
+A typical run directory contains artifacts like:
 
-- `flux-core` headers and libraries
-- `jansson`
+- `run.log`
+- `broker.log`
+- `emu.log`
+- `job_transitions.csv`
+- `eventlog.csv`
+- `resource_usage_timeseries.csv`
+- `resource_allocations.csv`
+- `resource_utilization.png` or `resource_utilization.svg`
+- `pernode.json`
 
-After installation, the main CLI can be invoked without `python -m`:
+## Profiling
+
+OpenTelemetry profiling is supported through `flux-fiction-run --otel`.
+
+Example:
 
 ```bash
-flux-fiction --config_file /path/to/config.toml
+cd /workspace/flux-fiction
+flux-fiction-run \
+  test/rabbit_storage_test/config_queue20_otel_debug.toml \
+  --otel \
+  --otel-service-name rabbit-tuolumne-profile \
+  --tag queue20-otel
 ```
 
-The harness that prepares run directories and launches a fresh Flux instance is:
+Important notes:
 
-```bash
-flux-fiction-run /path/to/config.toml
-```
+- A live OTLP collector is optional for local profiling.
+- Local profiling artifacts are still written even if `127.0.0.1:4318` is not
+  available.
+- Common local outputs include `otel_spans.jsonl`, `otel_bridge.log`, and
+  sometimes `otel_summary.csv`.
 
-#### Auspices
+## Repository Notes
+
+- `util/run_ff.py` remains as a source-tree compatibility wrapper around the
+  installed `flux-fiction-run` harness.
+- `load_jobtap.sh` will load the local build artifact or the installed plugin
+  path helper.
+- The preferred development path is the Podman container because it keeps Flux,
+  scheduler, Python, and native dependencies aligned.
+
+## Auspices
 
 This work was supported by the LLNL-LDRD Program under Project No. 24-SI-005.
 
-#### References
+## Reference
 
-Please use this bibtex to reference our work:
+Please use this bibtex to reference the project:
 
-```
+```bibtex
 @inproceedings{HPDCFluxEmulatorPoster,
   author    = {W. Jay Ashworth and Ian Lumsden and Jim Garlick and Mark Grondona and Olga Pearce and Stephanie Brink and Dewi Yokelson and Daniel Milroy and Tapasya Patki and Tom Scogland and Michela Taufer},
   title     = {{Poster: Flux Emulator: First Insights into Optimizing Scheduling for Exascale HPC}},
@@ -146,7 +242,7 @@ Please use this bibtex to reference our work:
 }
 ```
 
-#### License
+## License
 
 SPDX-License-Identifier: LGPL-3.0
 
