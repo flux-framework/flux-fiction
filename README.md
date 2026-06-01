@@ -20,7 +20,7 @@ artifacts that help you study scheduling behavior, resource use, and timing.
 
 ## Quickstart
 
-The recommended setup is a shared workspace with sibling checkouts:
+Flux Fiction is intended to be run inside of a containerized environment. It can be configured to run outside of a container, but this guide will show you how to set it up with a Podman container. The recommended setup is a shared workspace with sibling checkouts:
 
 ```text
 <workspace>/
@@ -96,46 +96,112 @@ flux-fiction-jobtap-path
 
 ## Dependencies
 
-### Python Package Dependencies
+### Runtime Dependencies
 
-Declared in `pyproject.toml`:
+Flux Fiction itself has a fairly small direct dependency surface:
 
-- `pydantic`
-- `tqdm`
+- `flux-core`
+  Needed for the Flux Python bindings, Flux RPCs, and the native jobtap plugin
+  interface.
+- Python packages:
+  - `pydantic`
+  - `tqdm`
 
-Optional extras:
+Optional Python extras:
 
-- `dev`: `build`, `meson`, `meson-python`, `pytest`, `pytest-cov`
-- `plot`: `matplotlib`
-- `otel`: `opentelemetry-api`, `opentelemetry-sdk`,
-  `opentelemetry-exporter-otlp-proto-http`
+- `plot`
+  - `matplotlib`
+- `otel`
+  - `opentelemetry-api`
+  - `opentelemetry-sdk`
+  - `opentelemetry-exporter-otlp-proto-http`
 
-### Native And System Dependencies
+### Jobtap Plugin Build Dependencies
 
-Required to build and run the jobtap plugin and the full simulator stack:
+If you are building the native `emu-jobtap.so` plugin, Flux Fiction also needs:
 
 - `flux-core` headers and libraries
-- `flux-sched`
 - `jansson`
 - `meson`
 - `ninja`
 - `pkg-config`
-- `gcc` / `g++`
-- `cmake`
-- `python3`, `pip`, and Python development headers
+- a C toolchain such as `gcc`
 
-### Dev Container Dependencies
+### Build Notes
 
-The Podman dev image additionally includes tooling commonly needed for local
-development and CI setup:
+- `flux-sched` is not a hard dependency of Flux Fiction itself.
+  It is used in the recommended dev environment because it provides a scheduler
+  that already works with the emulator, but Flux Fiction can run against other
+  Flux schedulers.
+- Podman is not a runtime dependency of Flux Fiction.
+  It is just the recommended reproducible development environment for this repo.
 
-- `pytest`
-- `pytest-cov`
-- `matplotlib`
-- `meson-python`
-- `build`
-- OpenTelemetry Python packages
-- debugging and build tools such as `gdb`, `valgrind`, `strace`, `tmux`
+## Scheduler Integration: `sched.quiescent`
+
+Flux Fiction’s emulator advances in discrete timesteps. After it submits jobs
+or processes completions for a step, it needs to know when the scheduler has
+finished reacting to that work before it is safe to advance the simulation.
+
+This is why the jobtap plugin probes the scheduler with the Flux RPC
+`sched.quiescent`.
+
+### Why It Is Needed
+
+- It gives the emulator a synchronization point between simulation timesteps.
+- It prevents the simulator from advancing while scheduler-side allocation work
+  is still in flight.
+- When start acknowledgements are batched, it helps the jobtap decide how many
+  newly allocated jobs need to be flushed into `start` acknowledgements for the
+  current step.
+
+Without this RPC, the emulator can observe an inconsistent state where Flux has
+accepted jobs, but the scheduler has not yet finished producing allocation/start
+side effects for that timestep.
+
+### What Flux Fiction Expects
+
+The jobtap sends:
+
+- RPC name: `sched.quiescent`
+- Request payload: `null`
+
+It expects a JSON response payload containing at least:
+
+```json
+{
+  "status": 0,
+  "alloc_current": 3
+}
+```
+
+Meaning:
+
+- `status`
+  `0` means the scheduler is quiescent and the probe succeeded.
+  Any nonzero value is treated as not quiescent or failed.
+- `alloc_current`
+  The number of currently allocated/running jobs visible to the scheduler at
+  the moment of the quiescence response.
+
+Flux Fiction’s jobtap uses `alloc_current` together with its own start/finish
+watermarks to infer how many new allocations were created in the current step.
+
+### Implementing It In Your Own Scheduler
+
+If you want to use a scheduler other than Fluxion, the main requirement is to
+provide a `sched.quiescent` RPC that:
+
+1. Waits until the scheduler has drained any work triggered by the current
+   batch of submissions or completions.
+2. Returns `status = 0` only when that quiescent point has been reached.
+3. Reports `alloc_current` as the scheduler’s current count of allocated/running
+   jobs.
+
+In practice, that usually means the handler should answer only after:
+
+- pending enqueue/dequeue work is complete
+- any allocation decisions for the current burst have been applied
+- the scheduler’s internal view of running allocations is stable
 
 ## Local Python Install
 
@@ -234,12 +300,12 @@ Please use this bibtex to reference the project:
 
 ```bibtex
 @inproceedings{HPDCFluxEmulatorPoster,
-  author    = {W. Jay Ashworth and Ian Lumsden and Jim Garlick and Mark Grondona and Olga Pearce and Stephanie Brink and Dewi Yokelson and Daniel Milroy and Tapasya Patki and Tom Scogland and Michela Taufer},
-  title     = {{Poster: Flux Emulator: First Insights into Optimizing Scheduling for Exascale HPC}},
+  author    = {W. Jay Ashworth and Ian Lumsden and Jim Garlick and Mark Grondona and Olga Pearce and Stephanie Brink and Daniel Milroy and Tapasya Patki and Tom Scogland and Michela Taufer},
+  title     = {{Poster: Flux Fiction: Hopping Toward Storage Graph Scheduling With El Capitan’s Rabbits}},
   booktitle = {Proceedings of the International ACM Symposium on High-Performance Parallel and Distributed Computing (HPDC)},
-  year      = {2025},
+  year      = {2026},
   month     = {July},
-  address   = {Notre Dame, IN, USA},
+  address   = {Cleveland, OH, USA},
   note      = {Poster Presentation}
 }
 ```

@@ -1,5 +1,3 @@
-#TODO decouple from flux using adapter for unit testing
-
 from __future__ import annotations
 
 import flux_fiction._core.errors as errors
