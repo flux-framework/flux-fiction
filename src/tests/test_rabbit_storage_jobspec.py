@@ -38,11 +38,12 @@ def test_rabbit_storage_jobspec_uses_gib_for_fluxion_count():
     assert job.rabbit_storage_share_count == 18
     assert job.rabbit_storage_request_count == 8154
 
-    rack = job.jobspec["resources"][0]
-    children = {child["type"]: child for child in rack["with"]}
+    rabbit_slot = job.jobspec["resources"][0]
+    children = {child["type"]: child for child in rabbit_slot["with"]}
 
-    assert rack["type"] == "rack"
-    assert rack["count"] == 1
+    assert rabbit_slot["type"] == "slot"
+    assert rabbit_slot["label"] == "rabbit"
+    assert rabbit_slot["count"] == 1
     assert children["node"]["count"] == 4
     assert children["ssd"]["count"] == 8154
     assert children["ssd"]["exclusive"] is True
@@ -59,10 +60,12 @@ def test_rabbit_storage_jobspec_splits_large_requests_across_parents():
     )
     job.set_rabbit_storage_shape(RABBIT_STORAGE)
 
-    rack = job.jobspec["resources"][0]
-    children = {child["type"]: child for child in rack["with"]}
+    rabbit_slot = job.jobspec["resources"][0]
+    children = {child["type"]: child for child in rabbit_slot["with"]}
 
-    assert rack["count"] == 2
+    assert rabbit_slot["type"] == "slot"
+    assert rabbit_slot["label"] == "rabbit"
+    assert rabbit_slot["count"] == 2
     assert children["node"]["count"] == 2
     assert children["ssd"]["count"] == 10000
 

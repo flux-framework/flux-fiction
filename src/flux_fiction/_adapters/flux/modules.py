@@ -254,7 +254,7 @@ def reload_modules(flux_handle, config_source=None):
                                                 "args": [ "noverify", "monitor-force-up"]}).get()
 
         flux_handle.rpc("module.load", payload={"path": fluxion_resource_path,
-                                                "args": [f"match-policy=lonodex"]}).get()
+                                                "args": []}).get()
 
         flux_handle.rpc("module.load", payload={"path": feasibility_module_path,
                                                 "args": []}).get()

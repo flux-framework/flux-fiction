@@ -91,11 +91,24 @@ git config --global --add safe.directory /workspace/flux-core >/dev/null 2>&1 ||
 git config --global --add safe.directory /workspace/flux-sched >/dev/null 2>&1 || true
 git config --global --add safe.directory /workspace/flux-fiction >/dev/null 2>&1 || true
 export FLUX_PREFIX=/workspace/container-installs/flux-core
+export FLUX_FICTION_PREFIX=/workspace/container-installs/flux-fiction
 export PATH="$FLUX_PREFIX/bin:$PATH"
+if [ -d "$FLUX_FICTION_PREFIX/bin" ]; then
+    export PATH="$FLUX_FICTION_PREFIX/bin:$PATH"
+fi
 export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CC=gcc-12
 export CXX=g++-12
+
+if command -v python3 >/dev/null 2>&1; then
+    _ff_pyver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    _ff_site="$FLUX_FICTION_PREFIX/lib/python${_ff_pyver}/site-packages"
+    if [ -d "$_ff_site" ]; then
+        export PYTHONPATH="$_ff_site:${PYTHONPATH:-}"
+    fi
+    unset _ff_pyver _ff_site
+fi
 
 if command -v flux >/dev/null 2>&1; then
     eval "$(flux env)" 2>/dev/null || true
@@ -157,7 +170,8 @@ mkdir -p build
 cd build
 CC=gcc-12 CXX=g++-12 cmake .. \
   -DCMAKE_INSTALL_PREFIX="$FLUX_PREFIX" \
-  -DCMAKE_PREFIX_PATH="$FLUX_PREFIX"
+  -DCMAKE_PREFIX_PATH="$FLUX_PREFIX" \
+  -DENABLE_DOCS=Off
 make -j"$(nproc)"
 make install
 
@@ -172,17 +186,20 @@ set -euo pipefail
 export SRC_ROOT=/workspace
 export INSTALL_ROOT="$SRC_ROOT/container-installs"
 export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
+export FLUX_FICTION_PREFIX="$INSTALL_ROOT/flux-fiction"
 
 git config --global --add safe.directory "$SRC_ROOT/flux-fiction" >/dev/null 2>&1 || true
 export PATH="$FLUX_PREFIX/bin:$PATH"
 export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
 
+mkdir -p "$FLUX_FICTION_PREFIX"
+
 cd "$SRC_ROOT/flux-fiction"
-python3 -m pip install --break-system-packages --no-deps -e .
+python3 -m pip install --break-system-packages --no-deps -e . --prefix "$FLUX_FICTION_PREFIX"
 
 echo
-echo "flux-fiction installed in editable mode"
+echo "flux-fiction installed in editable mode at: $FLUX_FICTION_PREFIX"
 echo "CLI commands: flux-fiction, flux-fiction-run, flux-fiction-jobtap-path"
 EOF
 

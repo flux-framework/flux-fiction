@@ -59,6 +59,16 @@ This gives you an editable install of `flux-fiction` and the main CLI commands:
 - `flux-fiction-run`
 - `flux-fiction-jobtap-path`
 
+The Flux Fiction install is written under the mounted workspace at
+`/workspace/container-installs/flux-fiction`. In a fresh
+container session, just run:
+
+```bash
+source /usr/local/bin/flux-dev-env.sh
+```
+
+and the Flux Fiction commands will be back on `PATH`.
+
 ### 4. Run A Smoke Test
 
 ```bash

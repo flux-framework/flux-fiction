@@ -36,7 +36,7 @@ class EngineResult:
 
 def run(config: object, adapter: Adapter) -> EngineResult:
     """
-    Core entrypoint. Eventually this will:
+    Core entrypoint. This will:
       - init Flux adapter
       - load resources
       - load traces
@@ -55,10 +55,13 @@ def run(config: object, adapter: Adapter) -> EngineResult:
             seed=config.faketime_seed,
         )
 
+    #TODO describe_resources seems fragile. Look into what can break it and if it can work with heterogenenous resources. We could probably use flux for this instead of parsing the jgf/config
     resource_desc = adapter.describe_resources(config)
     resource_nnodes = int(resource_desc.get("nnodes") or config.nnodes)
     resource_cores_per_node = int(resource_desc.get("cores_per_node") or config.ncpus)
     resource_gpus_per_node = int(resource_desc.get("gpus_per_node") or config.ngpus or 0)
+
+    #TODO understand how jobspec_shape is generated
     jobspec_shape = resource_desc.get("jobspec_shape", {})
     rabbit_storage = resource_desc.get("rabbit_storage", {})
     node_exclusive_accounting = bool(
@@ -68,7 +71,6 @@ def run(config: object, adapter: Adapter) -> EngineResult:
 
     kvs_size_start = int(adapter.get_kvs_stats().get("dbfile_size", 0))
 
-    #TODO Is this validation needed or can it be overhauled?>
     exec_validator = SimpleExec(
         resource_nnodes,
         resource_cores_per_node,

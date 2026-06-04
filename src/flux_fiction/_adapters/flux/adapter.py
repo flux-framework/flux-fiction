@@ -62,16 +62,7 @@ class FluxAdapter:
         self._watchers = None
         self._services = None
 
-# TODO: add in a parameter to allow you to just specify module parameters instead of putting a 
-# function paramater for every single module paramter 
-
-#TODO Fix this to where it will try to load the jobtap plugin if it isn't loaded
-
-
-# TODO: Make the journal into a logging feature 
-        
-
-#TODO See if I can use this with the exec module? Then again it might be good to have a standard interface from Flux to engine and then from engine to the exec system. 
+    #TODO See if I can use this with the exec module? Then again it might be good to have a standard interface from Flux to engine and then from engine to the exec system. 
 
     def install_resources(self, cfg):
         ''''''
@@ -106,8 +97,6 @@ class FluxAdapter:
     
     def reload_scheduler(self, cfg):
         ''''''
-        #TODO Make this configurable from the config file
-        # modules.reload_modules(self._handle, queue_policy="hybrid", match_policy="lonodex", res_depth=32)
         modules.reload_modules(self._handle, cfg.config_json)
 
         modules.load_missing_modules(self._handle)

@@ -183,30 +183,28 @@ class Job(object):
             int(self.rabbit_storage_request_count),
         )
         ssd_section["exclusive"] = True
-        if not self.rabbit_storage_parent_type:
-            return [node_section, ssd_section]
+        bundle_count = 1
+        if self.rabbit_storage_parent_type:
+            nodes_per_parent = int(self.rabbit_storage_nodes_per_parent or self.nnodes or 1)
+            storage_per_parent = float(
+                self.rabbit_storage_parent_gib
+                or (self.rabbit_storage_shares_per_parent * self.rabbit_storage_share_gib)
+                or self.rabbit_storage_request_count
+                or 1
+            )
+            bundle_count = max(
+                1,
+                math.ceil(self.nnodes / nodes_per_parent),
+                math.ceil(self.rabbit_storage_request_count / storage_per_parent),
+            )
+            node_section = dict(node_section)
+            node_section["count"] = max(1, math.ceil(self.nnodes / bundle_count))
+            ssd_section["count"] = max(
+                1,
+                math.ceil(self.rabbit_storage_request_count / bundle_count),
+            )
 
-        nodes_per_parent = int(self.rabbit_storage_nodes_per_parent or self.nnodes or 1)
-        storage_per_parent = float(
-            self.rabbit_storage_parent_gib
-            or (self.rabbit_storage_shares_per_parent * self.rabbit_storage_share_gib)
-            or self.rabbit_storage_request_count
-            or 1
-        )
-        parent_count = max(
-            1,
-            math.ceil(self.nnodes / nodes_per_parent),
-            math.ceil(self.rabbit_storage_request_count / storage_per_parent),
-        )
-        node_section = dict(node_section)
-        node_section["count"] = max(1, math.ceil(self.nnodes / parent_count))
-        ssd_section["count"] = max(1, math.ceil(self.rabbit_storage_request_count / parent_count))
-
-        return [create_resource(
-            self.rabbit_storage_parent_type,
-            parent_count,
-            [node_section, ssd_section],
-        )]
+        return [create_slot("rabbit", bundle_count, [node_section, ssd_section])]
 
 
     def set_jobspec_shape(self, shape):
