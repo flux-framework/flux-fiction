@@ -1,0 +1,13 @@
+option(
+  'use_system_flux',
+  type: 'boolean',
+  value: true,
+  description: 'Link emu-jobtap against a system-installed flux-core before trying the sibling checkout.',
+)
+
+option(
+  'flux_prefix',
+  type: 'string',
+  value: '',
+  description: 'Optional flux-core installation prefix used when searching for headers and libraries.',
+)

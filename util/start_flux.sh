@@ -24,4 +24,9 @@ if $CLEAN; then
   fi
 fi
 
-flux start --broker-opts="--setattr=log-filename=$LOGFILE"
+flux start --broker-opts="--setattr=log-filename=$LOGFILE" -- bash -lc '
+  cd ..
+  source ./load_jobtap.sh
+  cd src
+  exec bash -i
+'
