@@ -20,6 +20,15 @@ def _candidate_paths() -> list[Path]:
 
     repo_root = Path(__file__).resolve().parents[2]
     candidates.append(repo_root / "build" / "emu-jobtap.so")
+    candidates.append(repo_root / "build" / "src" / "emu-jobtap.so")
+
+    build_root = repo_root / "build"
+    if build_root.is_dir():
+        for child in sorted(build_root.iterdir()):
+            if not child.is_dir():
+                continue
+            candidates.append(child / "emu-jobtap.so")
+            candidates.append(child / "src" / "emu-jobtap.so")
 
     return candidates
 

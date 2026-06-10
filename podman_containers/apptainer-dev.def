@@ -1,13 +1,15 @@
-FROM ubuntu:24.04
+BootStrap: docker
+From: ubuntu:24.04
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LC_ALL=C
-ENV LANG=C
-ENV PATH=/usr/local/bin:/usr/bin:/bin:$PATH
-ENV CC=gcc-12
-ENV CXX=g++-12
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C
+    export LANG=C
+    export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+    export CC=gcc-12
+    export CXX=g++-12
 
-RUN echo 'APT::Sandbox::User root;' > /etc/apt/apt.conf.d/00-apt-sandbox && \
+    echo 'APT::Sandbox::User root;' > /etc/apt/apt.conf.d/00-apt-sandbox && \
     apt-get update && \
     apt-get install -y \
         autoconf \
@@ -77,16 +79,16 @@ RUN echo 'APT::Sandbox::User root;' > /etc/apt/apt.conf.d/00-apt-sandbox && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --break-system-packages \
+    python3 -m pip install --break-system-packages \
         build \
         meson-python \
         opentelemetry-api \
         opentelemetry-sdk \
         opentelemetry-exporter-otlp-proto-http
 
-RUN mkdir -p /work /data /output /scratch
+    mkdir -p /work /data /output /scratch /workspace
 
-RUN cat > /usr/local/bin/flux-dev-env.sh <<'EOF'
+    cat > /usr/local/bin/flux-dev-env.sh <<'EOF'
 #!/bin/bash
 git config --global --add safe.directory /workspace/flux-core >/dev/null 2>&1 || true
 git config --global --add safe.directory /workspace/flux-sched >/dev/null 2>&1 || true
@@ -134,10 +136,9 @@ if command -v flux >/dev/null 2>&1; then
     eval "$(flux env)" 2>/dev/null || true
 fi
 EOF
+    chmod +x /usr/local/bin/flux-dev-env.sh
 
-RUN chmod +x /usr/local/bin/flux-dev-env.sh
-
-RUN cat > /usr/local/bin/build-flux-core.sh <<'EOF'
+    cat > /usr/local/bin/build-flux-core.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -158,8 +159,9 @@ make install
 echo
 echo "flux-core installed to: $FLUX_PREFIX"
 EOF
+    chmod +x /usr/local/bin/build-flux-core.sh
 
-RUN cat > /usr/local/bin/build-flux-sched.sh <<'EOF'
+    cat > /usr/local/bin/build-flux-sched.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -198,8 +200,9 @@ make install
 echo
 echo "flux-sched installed to: $FLUX_PREFIX"
 EOF
+    chmod +x /usr/local/bin/build-flux-sched.sh
 
-RUN cat > /usr/local/bin/build-flux-fiction.sh <<'EOF'
+    cat > /usr/local/bin/build-flux-fiction.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -222,8 +225,9 @@ echo
 echo "flux-fiction installed in editable mode at: $FLUX_FICTION_PREFIX"
 echo "CLI commands: flux-fiction, flux-fiction-run, flux-fiction-jobtap-path"
 EOF
+    chmod +x /usr/local/bin/build-flux-fiction.sh
 
-RUN cat > /usr/local/bin/build-flux-stack.sh <<'EOF'
+    cat > /usr/local/bin/build-flux-stack.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -234,14 +238,9 @@ set -euo pipefail
 echo
 echo "Build complete."
 EOF
+    chmod +x /usr/local/bin/build-flux-stack.sh
 
-RUN chmod +x \
-    /usr/local/bin/build-flux-core.sh \
-    /usr/local/bin/build-flux-sched.sh \
-    /usr/local/bin/build-flux-fiction.sh \
-    /usr/local/bin/build-flux-stack.sh
-
-RUN cat > /etc/profile.d/flux-dev.sh <<'EOF'
+    cat > /etc/profile.d/flux-dev.sh <<'EOF'
 source /usr/local/bin/flux-dev-env.sh
 
 alias rebuild-flux-core='/usr/local/bin/build-flux-core.sh'
@@ -250,4 +249,12 @@ alias rebuild-flux-fiction='/usr/local/bin/build-flux-fiction.sh'
 alias rebuild-flux-stack='/usr/local/bin/build-flux-stack.sh'
 EOF
 
-CMD ["/bin/bash", "-l"]
+%environment
+    export LC_ALL=C
+    export LANG=C
+    export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+    export CC=gcc-12
+    export CXX=g++-12
+
+%runscript
+    exec /bin/bash -l "$@"
