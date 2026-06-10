@@ -31,6 +31,9 @@ Flux Fiction is intended to be run inside of a containerized environment. It can
 
 ### 1. Build The Dev Image
 
+On LC systems, run `enable-podman` once per enclave before building or running
+containers, and prefer doing image builds on an allocated compute node.
+
 ```bash
 cd flux-fiction/podman_containers
 ./build_container.sh flux-fiction-dev
@@ -38,42 +41,49 @@ cd flux-fiction/podman_containers
 
 ### 2. Start The Container
 
-From the workspace parent directory:
+Back out to the workspace directory and launch the container
 
 ```bash
+cd <workspace>/
 podman run --rm -it -v "$(pwd)":/workspace flux-fiction-dev
 ```
+
+The mounted host workspace will be available inside the container at
+`/workspace`.
 
 ### 3. Build And Install Inside The Container
 
 ```bash
-source /usr/local/bin/flux-dev-env.sh
+/usr/local/bin/build-flux-stack.sh
+```
+
+This gives you:
+
+- `flux-core` and `flux-sched` installed under `/workspace/container-installs/flux-core`
+- an editable `flux-fiction` install in the container Python environment
+- CLI commands available: `flux-fiction`, `flux-fiction-run`, and `flux-fiction-jobtap-path`
+
+Or rebuild each repo individually:
+
+```bash
 /usr/local/bin/build-flux-core.sh
 /usr/local/bin/build-flux-sched.sh
 /usr/local/bin/build-flux-fiction.sh
 ```
 
-This gives you an editable install of `flux-fiction` and the main CLI commands:
+In the default interactive container flow, the environment setup is loaded
+automatically by the login shell. If commands are missing from `PATH` or Flux
+libraries are not found, it is worth trying
+`source /usr/local/bin/flux-dev-env.sh` as a troubleshooting step.
 
-- `flux-fiction`
-- `flux-fiction-run`
-- `flux-fiction-jobtap-path`
-
-The Flux Fiction install is written under the mounted workspace at
-`/workspace/container-installs/flux-fiction`. In a fresh
-container session, just run:
-
-```bash
-source /usr/local/bin/flux-dev-env.sh
-```
-
-and the Flux Fiction commands will be back on `PATH`.
+Re-run `build-flux-core.sh` or `build-flux-sched.sh` only when those components
+need rebuilding.
 
 ### 4. Run A Smoke Test
 
 ```bash
-cd /workspace/flux-fiction
-flux-fiction-run test/simple_test/config.toml --tag smoke --no-faketime
+cd /workspace/flux-fiction/src
+flux-fiction-run config.toml --tag smoke --no-faketime
 ```
 
 ### 5. Run Tests
@@ -253,20 +263,6 @@ automatically try:
 
 - `../container-installs/flux-core`
 - `../flux-core`
-
-## Outputs
-
-A typical run directory contains artifacts like:
-
-- `run.log`
-- `broker.log`
-- `emu.log`
-- `job_transitions.csv`
-- `eventlog.csv`
-- `resource_usage_timeseries.csv`
-- `resource_allocations.csv`
-- `resource_utilization.png` or `resource_utilization.svg`
-- `pernode.json`
 
 ## Profiling
 

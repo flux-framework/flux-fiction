@@ -1,6 +1,14 @@
 BootStrap: docker
 From: ubuntu:24.04
 
+%files
+    scripts/flux-dev-env.sh /usr/local/bin/flux-dev-env.sh
+    scripts/build-flux-core.sh /usr/local/bin/build-flux-core.sh
+    scripts/build-flux-sched.sh /usr/local/bin/build-flux-sched.sh
+    scripts/build-flux-fiction.sh /usr/local/bin/build-flux-fiction.sh
+    scripts/build-flux-stack.sh /usr/local/bin/build-flux-stack.sh
+    scripts/flux-dev-profile.sh /etc/profile.d/flux-dev.sh
+
 %post
     export DEBIAN_FRONTEND=noninteractive
     export LC_ALL=C
@@ -9,7 +17,7 @@ From: ubuntu:24.04
     export CC=gcc-12
     export CXX=g++-12
 
-    echo 'APT::Sandbox::User root;' > /etc/apt/apt.conf.d/00-apt-sandbox && \
+    echo 'APT::Sandbox::User root;' > /etc/apt/apt.conf.d/00-apt-sandbox
     apt-get update && \
     apt-get install -y \
         autoconf \
@@ -88,166 +96,12 @@ From: ubuntu:24.04
 
     mkdir -p /work /data /output /scratch /workspace
 
-    cat > /usr/local/bin/flux-dev-env.sh <<'EOF'
-#!/bin/bash
-git config --global --add safe.directory /workspace/flux-core >/dev/null 2>&1 || true
-git config --global --add safe.directory /workspace/flux-sched >/dev/null 2>&1 || true
-git config --global --add safe.directory /workspace/flux-fiction >/dev/null 2>&1 || true
-export FLUX_PREFIX=/workspace/container-installs/flux-core
-export FLUX_FICTION_PREFIX=/workspace/container-installs/flux-fiction
-export PATH="$FLUX_PREFIX/bin:$PATH"
-if [ -d "$FLUX_FICTION_PREFIX/bin" ]; then
-    export PATH="$FLUX_FICTION_PREFIX/bin:$PATH"
-fi
-if [ -d "$FLUX_FICTION_PREFIX/local/bin" ]; then
-    export PATH="$FLUX_FICTION_PREFIX/local/bin:$PATH"
-fi
-export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
-export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CC=gcc-12
-export CXX=g++-12
-
-if command -v python3 >/dev/null 2>&1; then
-    _ff_pyver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    _ff_site="$FLUX_FICTION_PREFIX/lib/python${_ff_pyver}/site-packages"
-    _ff_dist="$FLUX_FICTION_PREFIX/lib/python${_ff_pyver}/dist-packages"
-    _ff_local_site="$FLUX_FICTION_PREFIX/local/lib/python${_ff_pyver}/site-packages"
-    _ff_local_dist="$FLUX_FICTION_PREFIX/local/lib/python${_ff_pyver}/dist-packages"
-    if [ -d "$_ff_site" ]; then
-        export PYTHONPATH="$_ff_site:${PYTHONPATH:-}"
-    fi
-    if [ -d "$_ff_dist" ]; then
-        export PYTHONPATH="$_ff_dist:${PYTHONPATH:-}"
-    fi
-    if [ -d "$_ff_local_site" ]; then
-        export PYTHONPATH="$_ff_local_site:${PYTHONPATH:-}"
-    fi
-    if [ -d "$_ff_local_dist" ]; then
-        export PYTHONPATH="$_ff_local_dist:${PYTHONPATH:-}"
-    fi
-    unset _ff_pyver _ff_site _ff_dist _ff_local_site _ff_local_dist
-fi
-
-if [ -d /workspace/flux-fiction/src ]; then
-    export PYTHONPATH="/workspace/flux-fiction/src:${PYTHONPATH:-}"
-fi
-
-if command -v flux >/dev/null 2>&1; then
-    eval "$(flux env)" 2>/dev/null || true
-fi
-EOF
-    chmod +x /usr/local/bin/flux-dev-env.sh
-
-    cat > /usr/local/bin/build-flux-core.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-export SRC_ROOT=/workspace
-export INSTALL_ROOT="$SRC_ROOT/container-installs"
-export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
-
-git config --global --add safe.directory "$SRC_ROOT/flux-core" >/dev/null 2>&1 || true
-mkdir -p "$INSTALL_ROOT/flux-core"
-
-cd "$SRC_ROOT/flux-core"
-make distclean || true
-./autogen.sh
-CC=gcc-12 CXX=g++-12 ./configure --prefix="$FLUX_PREFIX"
-make -j"$(nproc)"
-make install
-
-echo
-echo "flux-core installed to: $FLUX_PREFIX"
-EOF
-    chmod +x /usr/local/bin/build-flux-core.sh
-
-    cat > /usr/local/bin/build-flux-sched.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-export SRC_ROOT=/workspace
-export INSTALL_ROOT="$SRC_ROOT/container-installs"
-export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
-
-git config --global --add safe.directory "$SRC_ROOT/flux-sched" >/dev/null 2>&1 || true
-export PATH="$FLUX_PREFIX/bin:$PATH"
-export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
-export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-if [ -z "${FLUX_SCHED_VERSION:-}" ]; then
-  FLUX_SCHED_GIT_VERSION="$(cd "$SRC_ROOT/flux-sched" && git describe --tags --always 2>/dev/null || true)"
-  case "$FLUX_SCHED_GIT_VERSION" in
-    ''|*[!0-9.]*)
-      export FLUX_SCHED_VERSION=0.0.0
-      ;;
-    *)
-      export FLUX_SCHED_VERSION="${FLUX_SCHED_GIT_VERSION#v}"
-      ;;
-  esac
-fi
-
-cd "$SRC_ROOT/flux-sched"
-rm -rf build
-mkdir -p build
-cd build
-CC=gcc-12 CXX=g++-12 cmake .. \
-  -DCMAKE_INSTALL_PREFIX="$FLUX_PREFIX" \
-  -DCMAKE_PREFIX_PATH="$FLUX_PREFIX" \
-  -DENABLE_DOCS=Off
-make -j"$(nproc)"
-make install
-
-echo
-echo "flux-sched installed to: $FLUX_PREFIX"
-EOF
-    chmod +x /usr/local/bin/build-flux-sched.sh
-
-    cat > /usr/local/bin/build-flux-fiction.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-export SRC_ROOT=/workspace
-export INSTALL_ROOT="$SRC_ROOT/container-installs"
-export FLUX_PREFIX="$INSTALL_ROOT/flux-core"
-export FLUX_FICTION_PREFIX="$INSTALL_ROOT/flux-fiction"
-
-git config --global --add safe.directory "$SRC_ROOT/flux-fiction" >/dev/null 2>&1 || true
-export PATH="$FLUX_PREFIX/bin:$PATH"
-export LD_LIBRARY_PATH="$FLUX_PREFIX/lib:$FLUX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
-export PKG_CONFIG_PATH="$FLUX_PREFIX/lib/pkgconfig:$FLUX_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-mkdir -p "$FLUX_FICTION_PREFIX"
-
-cd "$SRC_ROOT/flux-fiction"
-python3 -m pip install --break-system-packages --no-deps -e . --prefix "$FLUX_FICTION_PREFIX"
-
-echo
-echo "flux-fiction installed in editable mode at: $FLUX_FICTION_PREFIX"
-echo "CLI commands: flux-fiction, flux-fiction-run, flux-fiction-jobtap-path"
-EOF
-    chmod +x /usr/local/bin/build-flux-fiction.sh
-
-    cat > /usr/local/bin/build-flux-stack.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-/usr/local/bin/build-flux-core.sh
-/usr/local/bin/build-flux-sched.sh
-/usr/local/bin/build-flux-fiction.sh
-
-echo
-echo "Build complete."
-EOF
-    chmod +x /usr/local/bin/build-flux-stack.sh
-
-    cat > /etc/profile.d/flux-dev.sh <<'EOF'
-source /usr/local/bin/flux-dev-env.sh
-
-alias rebuild-flux-core='/usr/local/bin/build-flux-core.sh'
-alias rebuild-flux-sched='/usr/local/bin/build-flux-sched.sh'
-alias rebuild-flux-fiction='/usr/local/bin/build-flux-fiction.sh'
-alias rebuild-flux-stack='/usr/local/bin/build-flux-stack.sh'
-EOF
+    chmod +x \
+        /usr/local/bin/flux-dev-env.sh \
+        /usr/local/bin/build-flux-core.sh \
+        /usr/local/bin/build-flux-sched.sh \
+        /usr/local/bin/build-flux-fiction.sh \
+        /usr/local/bin/build-flux-stack.sh
 
 %environment
     export LC_ALL=C
