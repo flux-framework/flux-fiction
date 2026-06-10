@@ -62,6 +62,8 @@ From the host workspace parent directory:
 podman run --rm -it -v "$(pwd)":/workspace flux-fiction-dev
 ```
 
+The mounted host workspace will be available at `/workspace`.
+
 If not already in the workspace parent directory, mount it explicitly:
 
 ```bash
@@ -87,11 +89,8 @@ The shell profile also defines aliases:
 
 In non-interactive shells, prefer the script paths directly because aliases may not be expanded.
 
-Before manual work, it is safe to source:
-
-```bash
-source /usr/local/bin/flux-dev-env.sh
-```
+If commands are missing from `PATH` or Flux libraries are not found, it is
+worth trying `source /usr/local/bin/flux-dev-env.sh`.
 
 That script also configures Git safe directories for the mounted repos.
 
@@ -115,7 +114,7 @@ Notes:
 
 - `flux-core` installs into `/workspace/container-installs/flux-core`
 - `flux-sched` installs into the same prefix
-- `flux-fiction` builds `build/emu-jobtap.so`
+- `flux-fiction` installs into the container Python environment and builds the native jobtap under the source tree Meson build directory
 
 ## Load The Jobtap Plugin
 
@@ -129,7 +128,7 @@ source ./load_jobtap.sh
 That script expects the plugin at:
 
 ```text
-/workspace/flux-fiction/build/emu-jobtap.so
+/workspace/flux-fiction/build/<python-tag>/src/emu-jobtap.so
 ```
 
 ## Run Flux Fiction
@@ -141,14 +140,14 @@ The standard harness is:
 Simple smoke run:
 
 ```bash
-cd /workspace/flux-fiction
-flux-fiction-run /workspace/flux-fiction/test/simple_test/config.toml --tag smoke
+cd /workspace/flux-fiction/src
+flux-fiction-run config.toml --tag smoke
 ```
 
 If faketime is causing trouble during debugging:
 
 ```bash
-flux-fiction-run /workspace/flux-fiction/test/simple_test/config.toml --tag smoke --no-faketime
+flux-fiction-run config.toml --tag smoke --no-faketime
 ```
 
 ## OpenTelemetry Profiling
@@ -196,7 +195,8 @@ For jobtap-side `sched.quiescent` timing, inspect spans named:
 1. Confirm the host workspace contains sibling checkouts of `flux-core`, `flux-sched`, and `flux-fiction`.
 2. Rebuild the image only if `Containerfile` or OS-level dependencies changed.
 3. Start the container with the workspace mounted to `/workspace`.
-4. Source `/usr/local/bin/flux-dev-env.sh`.
+4. Source `/usr/local/bin/flux-dev-env.sh` only if the shell environment is not
+   already set up correctly.
 5. Rebuild only the component you changed.
 6. Use `flux-fiction-run ...` for testing, not ad hoc broker commands.
 7. For scheduler timing questions, prefer the rabbit OTel configs and inspect local JSONL spans first.
