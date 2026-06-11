@@ -129,8 +129,7 @@ Flux Fiction itself has a fairly small direct dependency surface:
 
 Optional Python extras:
 
-- `plot`
-  - `matplotlib`
+- `matplotlib`
 - `otel`
   - `opentelemetry-api`
   - `opentelemetry-sdk`
