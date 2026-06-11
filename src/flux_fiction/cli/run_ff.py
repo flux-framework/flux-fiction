@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import hashlib
 from typing import Any
@@ -119,6 +121,98 @@ def drop_faketime_env(env: dict[str, str]) -> dict[str, str]:
         if key == "LD_PRELOAD" or key.startswith("FAKETIME_"):
             cleaned.pop(key, None)
     return cleaned
+
+
+def broker_log_matches(log_path: Path, needle: str) -> list[str]:
+    if not log_path.exists():
+        return []
+
+    matches: list[str] = []
+    with log_path.open("r", encoding="utf-8", errors="replace") as f:
+        for lineno, line in enumerate(f, start=1):
+            if needle in line:
+                matches.append(f"{lineno}: {line.rstrip()}")
+    return matches
+
+
+SCHED_RESOURCE_ERROR_NEEDLE = "sched-fluxion-resource.err"
+
+
+def _terminate_process_group(proc: subprocess.Popen[str], sig: int) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+
+
+def _watch_broker_log_for_fatal_error(
+    broker_log: Path,
+    proc: subprocess.Popen[str],
+    detected: dict[str, str],
+    run_root: Path,
+) -> None:
+    offset = 0
+    last_match = ""
+
+    while proc.poll() is None:
+        if broker_log.exists():
+            with broker_log.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(offset)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    if SCHED_RESOURCE_ERROR_NEEDLE in line:
+                        last_match = line.rstrip()
+                        detected["message"] = (
+                            "Detected sched-fluxion-resource.err in broker log; "
+                            "terminating Flux instance.\n{}".format(last_match)
+                        )
+                        break
+                offset = f.tell()
+
+        if last_match:
+            print(detected["message"], file=sys.stderr, flush=True)
+            sentinel = run_root / ".fatal_scheduler_error"
+            try:
+                sentinel.write_text(detected["message"] + "\n")
+            except Exception:
+                print(
+                    f"Failed to write fatal-error sentinel at {sentinel}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            grace_s = float(os.environ.get("FLUX_FICTION_FATAL_ERROR_GRACE_SECONDS", "10"))
+            output_dir = run_root / "output"
+            deadline = time.time() + max(0.0, grace_s)
+            while proc.poll() is None and time.time() < deadline:
+                done_marker = output_dir / ".emergency_dump_done"
+                if done_marker.exists():
+                    print(
+                        "Fatal scheduler error detected; emergency diagnostics were written.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
+                time.sleep(0.2)
+            _terminate_process_group(proc, signal.SIGTERM)
+
+            deadline = time.time() + 10.0
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+
+            if proc.poll() is None:
+                print(
+                    "Flux instance did not exit after SIGTERM; sending SIGKILL.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _terminate_process_group(proc, signal.SIGKILL)
+            return
+
+        time.sleep(0.2)
 
 
 def first_submit_epoch(trace_path: Path) -> float:
@@ -250,6 +344,15 @@ def prepare_config(
 
 
 def build_inner_script(ff_root: Path, generated_config: Path, stampfile: str | None) -> str:
+    run_root = generated_config.parent
+    output_dir = run_root / "output"
+    fatal_sentinel = run_root / ".fatal_scheduler_error"
+    emergency_done = output_dir / ".emergency_dump_done"
+    emergency_eventlogs = output_dir / "emergency_eventlogs.txt"
+    emergency_alloc_json = output_dir / "emergency_allocations.json"
+    emergency_alloc_txt = output_dir / "emergency_allocations.txt"
+    emergency_jobspecs = output_dir / "emergency_jobspecs.txt"
+    emergency_flux_config = output_dir / "emergency_flux_config.json"
     args = [
         "flux-fiction",
         "--config_file",
@@ -266,12 +369,202 @@ def build_inner_script(ff_root: Path, generated_config: Path, stampfile: str | N
             "0",
         ])
 
+    python_dump = """
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+jobs_path = Path({jobs_path!r})
+eventlog_path = Path({eventlog_path!r})
+alloc_path = Path({alloc_path!r})
+jobspec_path = Path({jobspec_path!r})
+flux_config_path = Path({flux_config_path!r})
+done_path = Path({done_path!r})
+
+COMMAND_TIMEOUT = float(os.environ.get("FLUX_FICTION_EMERGENCY_DUMP_TIMEOUT_SECONDS", "3"))
+TOTAL_BUDGET = float(os.environ.get("FLUX_FICTION_EMERGENCY_DUMP_BUDGET_SECONDS", "8"))
+JOB_DETAIL_LIMIT = int(os.environ.get("FLUX_FICTION_EMERGENCY_JOB_LIMIT", "20"))
+deadline = time.monotonic() + max(1.0, TOTAL_BUDGET)
+
+
+def remaining_budget() -> float:
+    return deadline - time.monotonic()
+
+
+def run_capture(args):
+    remaining = remaining_budget()
+    if remaining <= 0:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=124,
+            stdout="",
+            stderr="[skipped: emergency dump time budget exceeded]\\n",
+        )
+    timeout = min(COMMAND_TIMEOUT, max(0.25, remaining))
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ""
+        if stderr and not stderr.endswith("\\n"):
+            stderr += "\\n"
+        stderr += f"[timed out after {{timeout:.2f}}s]\\n"
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=124,
+            stdout=exc.stdout or "",
+            stderr=stderr,
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=125,
+            stdout="",
+            stderr=f"[exception] {{type(exc).__name__}}: {{exc}}\\n",
+        )
+
+
+for path in (jobs_path, eventlog_path, alloc_path, jobspec_path, flux_config_path):
+    path.write_text("[emergency dump started]\\n")
+
+jobs_payload = "{{}}"
+jobs = []
+jobs_proc = run_capture(["flux", "jobs", "-a", "--json"])
+if jobs_proc.stdout.strip():
+    jobs_payload = jobs_proc.stdout
+jobs_path.write_text(jobs_payload)
+
+if jobs_proc.returncode == 0:
+    try:
+        jobs = json.loads(jobs_payload).get("jobs", [])
+    except Exception:
+        jobs = []
+
+flux_config_proc = run_capture(["bash", "-lc", "flux config get | jq"])
+if flux_config_proc.stdout.strip():
+    flux_config_path.write_text(flux_config_proc.stdout)
+else:
+    lines = ["flux config get | jq produced no stdout\\n"]
+    if flux_config_proc.stderr:
+        lines.extend(["[stderr]\\n", flux_config_proc.stderr])
+    flux_config_path.write_text("".join(lines))
+if flux_config_proc.returncode != 0 and flux_config_proc.stderr:
+    with flux_config_path.open("a") as cf:
+        if flux_config_proc.stdout.strip():
+            cf.write("\\n")
+        cf.write("[stderr]\\n" + flux_config_proc.stderr)
+
+with eventlog_path.open("w") as ef, alloc_path.open("w") as af, jobspec_path.open("w") as jf:
+    detailed_jobs = jobs[:JOB_DETAIL_LIMIT]
+    if len(jobs) > len(detailed_jobs):
+        note = (
+            f"[truncated detailed job dumps at {{len(detailed_jobs)}} of {{len(jobs)}} jobs; "
+            "full job list is in emergency_allocations.json]\\n"
+        )
+        ef.write(note)
+        af.write(note)
+        jf.write(note)
+    if jobs_proc.returncode != 0:
+        ef.write("flux jobs --json failed\\n")
+        ef.write(jobs_proc.stderr)
+        af.write("flux jobs --json failed\\n")
+        af.write(jobs_proc.stderr)
+        jf.write("flux jobs --json failed\\n")
+        jf.write(jobs_proc.stderr)
+    for job in detailed_jobs:
+        if remaining_budget() <= 0:
+            budget_note = "[stopped collecting per-job diagnostics: emergency dump time budget exceeded]\\n"
+            ef.write(budget_note)
+            af.write(budget_note)
+            jf.write(budget_note)
+            break
+        jobid = str(job.get("jobid") or job.get("id") or "")
+        ef.write(f"=== {{jobid}} ===\\n")
+        eventlog_proc = run_capture(["flux", "job", "eventlog", jobid])
+        ef.write(eventlog_proc.stdout)
+        if eventlog_proc.stderr:
+            ef.write("\\n[stderr]\\n" + eventlog_proc.stderr)
+        ef.write("\\n")
+
+        af.write(f"=== {{jobid}} ===\\n")
+        af.write(json.dumps(job, sort_keys=True))
+        af.write("\\nR:\\n")
+        alloc_proc = run_capture(["flux", "job", "info", jobid, "R"])
+        af.write(alloc_proc.stdout)
+        if alloc_proc.stderr:
+            af.write("\\n[stderr]\\n" + alloc_proc.stderr)
+        af.write("\\n")
+
+        jobspec_proc = run_capture(["flux", "job", "info", jobid, "jobspec"])
+        if jobspec_proc.stdout.strip():
+            jf.write(jobspec_proc.stdout.rstrip() + "\\n")
+        else:
+            jf.write(f"=== {{jobid}} ===\\n")
+            jf.write("[jobspec missing]\\n")
+        if jobspec_proc.stderr:
+            jf.write("[stderr]\\n" + jobspec_proc.stderr)
+        if not jobspec_proc.stdout.endswith("\\n"):
+            jf.write("\\n")
+done_path.write_text("ok\\n")
+""".format(
+        jobs_path=str(emergency_alloc_json),
+        eventlog_path=str(emergency_eventlogs),
+        alloc_path=str(emergency_alloc_txt),
+        jobspec_path=str(emergency_jobspecs),
+        flux_config_path=str(emergency_flux_config),
+        done_path=str(emergency_done),
+    )
+
     return "\n".join([
         "set -euo pipefail",
         f"cd {shell_quote(ff_root)}",
         "source ./load_jobtap.sh",
-        " ".join(shell_quote(part) for part in args),
+        f"fatal_sentinel={shell_quote(fatal_sentinel)}",
+        f"emergency_done={shell_quote(emergency_done)}",
+        "emergency_dump() {",
+        "  if [[ -f \"${emergency_done}\" ]]; then",
+        "    return 0",
+        "  fi",
+        "  python3 - <<'PY'",
+        python_dump.strip(),
+        "PY",
+        "}",
+        "watch_fatal_sentinel() {",
+        "  while kill -0 \"${ff_pid}\" 2>/dev/null; do",
+        "    if [[ -f \"${fatal_sentinel}\" ]]; then",
+        "      emergency_dump || true",
+        "      kill -TERM \"${ff_pid}\" 2>/dev/null || true",
+        "      return 0",
+        "    fi",
+        "    sleep 0.2",
+        "  done",
+        "}",
+        " ".join(shell_quote(part) for part in args) + " &",
+        "ff_pid=$!",
+        "watch_fatal_sentinel &",
+        "fatal_watch_pid=$!",
+        "set +e",
+        "wait \"${ff_pid}\"",
+        "ff_rc=$?",
+        "set -e",
+        "kill \"${fatal_watch_pid}\" 2>/dev/null || true",
+        "wait \"${fatal_watch_pid}\" 2>/dev/null || true",
+        "if [[ -f \"${fatal_sentinel}\" ]]; then",
+        "  emergency_dump || true",
+        "fi",
+        "exit \"${ff_rc}\"",
     ])
+
+
+def write_inner_script(path: Path, script: str) -> None:
+    path.write_text(script + "\n")
+    path.chmod(0o755)
 
 
 def write_reproducer(
@@ -475,6 +768,8 @@ def main() -> int:
         env.update(faketime_env)
 
     inner_script = build_inner_script(ff_root, generated_config, stampfile)
+    inner_script_path = run_root / "run_inner.sh"
+    write_inner_script(inner_script_path, inner_script)
     flux_exe = shutil.which("flux", path=env.get("PATH")) or "flux"
     cmd = [
         flux_exe,
@@ -483,8 +778,7 @@ def main() -> int:
         f"--setattr=log-level={args.broker_log_level}",
         "--",
         "bash",
-        "-lc",
-        inner_script,
+        str(inner_script_path),
     ]
 
     bridge_cmd = None
@@ -544,6 +838,8 @@ def main() -> int:
 
     bridge_proc = None
     proc = None
+    broker_watch = None
+    detected_fatal_error: dict[str, str] = {}
     try:
         if bridge_cmd is not None:
             bridge_env = drop_faketime_env(env)
@@ -577,7 +873,14 @@ def main() -> int:
                 stderr=subprocess.STDOUT,
                 text=True,
                 errors="replace",
+                start_new_session=True,
             )
+            broker_watch = threading.Thread(
+                target=_watch_broker_log_for_fatal_error,
+                args=(broker_log, proc, detected_fatal_error, run_root),
+                daemon=True,
+            )
+            broker_watch.start()
             assert proc.stdout is not None
             for line in proc.stdout:
                 f.write(line)
@@ -585,6 +888,8 @@ def main() -> int:
                 sys.stdout.write(line)
             proc.wait()
     finally:
+        if broker_watch is not None:
+            broker_watch.join(timeout=1)
         if bridge_proc is not None:
             bridge_proc.terminate()
             try:
@@ -595,9 +900,48 @@ def main() -> int:
 
     if proc is None:
         return 1
+
+    broker_errors = broker_log_matches(broker_log, SCHED_RESOURCE_ERROR_NEEDLE)
+    emergency_dir = run_root / "output"
+    emergency_done = emergency_dir / ".emergency_dump_done"
+    emergency_files = [
+        emergency_dir / "emergency_eventlogs.txt",
+        emergency_dir / "emergency_allocations.json",
+        emergency_dir / "emergency_allocations.txt",
+        emergency_dir / "emergency_jobspecs.txt",
+        emergency_dir / "emergency_flux_config.json",
+    ]
+    if detected_fatal_error or broker_errors:
+        failure_path = run_root / "harness_failure.txt"
+        failure_lines = []
+        if detected_fatal_error:
+            failure_lines.append(detected_fatal_error["message"])
+        if broker_errors:
+            failure_lines.append(f"Detected {len(broker_errors)} broker log matches for {SCHED_RESOURCE_ERROR_NEEDLE}.")
+            failure_lines.extend(broker_errors[:20])
+        failure_path.write_text("\n".join(failure_lines) + "\n")
+        print(f"Harness failure report: {failure_path}", file=sys.stderr)
+    if emergency_done.exists():
+        print("Emergency diagnostics written:", file=sys.stderr)
+        for path in emergency_files:
+            if path.exists():
+                print(f"  {path}", file=sys.stderr)
     if proc.returncode != 0:
         print(f"Run failed with rc={proc.returncode}. See {stdout_log}", file=sys.stderr)
-    return proc.returncode
+    if broker_errors:
+        print(
+            (
+                "Run failed: detected sched-fluxion-resource.err in "
+                f"{broker_log}"
+            ),
+            file=sys.stderr,
+        )
+        for line in broker_errors[:5]:
+            print(f"  {line}", file=sys.stderr)
+        if len(broker_errors) > 5:
+            print(f"  ... {len(broker_errors) - 5} more matching lines", file=sys.stderr)
+
+    return proc.returncode or (1 if broker_errors else 0)
 
 
 if __name__ == "__main__":
