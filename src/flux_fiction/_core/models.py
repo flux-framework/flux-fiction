@@ -449,38 +449,33 @@ def _parse_float_field(row, field_name, default=0.0) -> float:
 
 _RABBIT_STORAGE_FIELDS = [
     "RabbitStorageGiB",
-    "RabbitStorageGB",
-    "RabbitGB",
+    "RabbitGiB",
     "RABBIT_STORAGE_GIB",
-    "RABBIT_STORAGE_GB",
-    "RABBIT_GB",
-    "SSD_GB",
+    "RABBIT_GIB",
     "SSD_GIB",
 ]
 
+_LEGACY_RABBIT_STORAGE_FIELDS = [
+    "RabbitStorageGB",
+    "RabbitGB",
+    "RABBIT_STORAGE_GB",
+    "RABBIT_GB",
+    "SSD_GB",
+]
 
-def _storage_value_to_gib(raw, default_unit="GiB") -> float:
+def _storage_value_to_gib(raw) -> float:
     if raw in (None, "", "0"):
         return 0.0
     text = str(raw).strip()
-    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]i?B|[KMGT]B)?$", text, re.IGNORECASE)
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(GiB)?$", text, re.IGNORECASE)
     if not match:
-        logger.warning("Invalid Rabbit storage value '%s'; treating as 0", raw)
+        logger.warning(
+            "Invalid Rabbit storage value '%s'; treating as 0. Rabbit storage must be expressed in GiB.",
+            raw,
+        )
         return 0.0
 
-    value = float(match.group(1))
-    unit = (match.group(2) or default_unit).upper()
-    factors = {
-        "KB": 1_000 / (1024 ** 3),
-        "KIB": 1 / (1024 ** 2),
-        "MB": 1_000_000 / (1024 ** 3),
-        "MIB": 1 / 1024,
-        "GB": 1_000_000_000 / (1024 ** 3),
-        "GIB": 1,
-        "TB": 1_000_000_000_000 / (1024 ** 3),
-        "TIB": 1024,
-    }
-    return value * factors.get(unit, 1)
+    return float(match.group(1))
 
 
 def _parse_rabbit_storage_gib(row) -> float:
@@ -490,8 +485,16 @@ def _parse_rabbit_storage_gib(row) -> float:
         if key is None:
             continue
         raw = row.get(key, "")
-        default_unit = "GiB" if "gib" in field.lower() else "GB"
-        return _storage_value_to_gib(raw, default_unit=default_unit)
+        return _storage_value_to_gib(raw)
+    for field in _LEGACY_RABBIT_STORAGE_FIELDS:
+        key = lower_to_key.get(field.lower())
+        if key is None:
+            continue
+        logger.warning(
+            "Rabbit storage field '%s' is no longer supported; use a GiB-named field such as RabbitGiB.",
+            key,
+        )
+        return 0.0
     return 0.0
 
 
@@ -595,7 +598,7 @@ class SacctReader(JobTraceReader):
 
     def validate_trace(self):
         with open(self.tracefile) as infile:
-            reader = csv.reader(infile, delimiter=self.delim)
+            reader = csv.reader(infile, delimiter=self.delim, skipinitialspace=True)
             header_fields = set(next(reader))
         required_fields = list(SacctReader.required_fields_base)
         if self.require_gpus:
@@ -612,7 +615,7 @@ class SacctReader(JobTraceReader):
         with open(self.tracefile) as infile:
             lines = [line for line in infile.readlines()
                      if not line.startswith('#')]
-            reader = csv.DictReader(lines, delimiter=self.delim)
+            reader = csv.DictReader(lines, delimiter=self.delim, skipinitialspace=True)
             jobs = [job_from_slurm_row(row) for row in reader]
         return jobs
 

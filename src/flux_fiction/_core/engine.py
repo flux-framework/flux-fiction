@@ -995,7 +995,6 @@ class Simulation(object):
                     .format(self.current_time, e)
                 )
                 raise RuntimeError("Quiescent broke") from e
-            logger.debug("meow")
             return
 
     # def is_quiescent(self):
