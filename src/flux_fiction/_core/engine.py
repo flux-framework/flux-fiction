@@ -64,6 +64,10 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     #TODO understand how jobspec_shape is generated
     jobspec_shape = resource_desc.get("jobspec_shape", {})
     rabbit_storage = resource_desc.get("rabbit_storage", {})
+    raw_jobspec_override = None
+    if getattr(config, "raw_jobspec_file", None):
+        with open(config.raw_jobspec_file, "r", encoding="utf-8") as f:
+            raw_jobspec_override = json.load(f)
     node_exclusive_accounting = bool(
         config.exclusive
         or output_vis.match_policy_is_node_exclusive(config.config_json)
@@ -116,14 +120,17 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         job.trace_index = idx  
  
     for job in jobs:
-        job.set_jobspec_shape(jobspec_shape)
-        job.set_rabbit_storage_shape(
-            rabbit_storage,
-            emit_dw=config.rabbit_storage_emit_dw,
-            name=config.rabbit_storage_name,
-        )
-        if config.exclusive:
-            job.set_exclusive(resource_cores_per_node, resource_gpus_per_node)
+        if raw_jobspec_override is not None:
+            job.set_jobspec_override(raw_jobspec_override)
+        else:
+            job.set_jobspec_shape(jobspec_shape)
+            job.set_rabbit_storage_shape(
+                rabbit_storage,
+                emit_dw=config.rabbit_storage_emit_dw,
+                name=config.rabbit_storage_name,
+            )
+            if config.exclusive:
+                job.set_exclusive(resource_cores_per_node, resource_gpus_per_node)
     for job in jobs:
         job.insert_apriori_events(simulation)
     pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)

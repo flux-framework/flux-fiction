@@ -108,6 +108,7 @@ class Job(object):
         self.rabbit_storage_request_count = 0
         self.rabbit_storage_emit_dw = False
         self.rabbit_storage_name = "rabbit"
+        self.raw_jobspec_override = None
 
         self.gap = float(gap or 0.0)
         self.end_latency = float(end_latency or 0.0)
@@ -257,6 +258,11 @@ class Job(object):
         self.cores_per_node = int(cores_per_node)
         self.gpus_per_node = int(gpus_per_node or 0)
         self._jobspec = None
+
+
+    def set_jobspec_override(self, jobspec_obj):
+        self.raw_jobspec_override = dict(jobspec_obj) if jobspec_obj is not None else None
+        self._jobspec = self.raw_jobspec_override
 
 
     def submit(self, adapter: Adapter):
