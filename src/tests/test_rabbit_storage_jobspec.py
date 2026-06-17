@@ -82,3 +82,44 @@ def test_rabbit_storage_capacity_prefers_storage_size_over_share_count():
     })
 
     assert capacities["ssd"] == 1153692.0
+
+
+def test_jobspec_override_bypasses_generated_shape():
+    job = Job(
+        nnodes=4,
+        ncpus=160,
+        submit_time=0,
+        elapsed_time=10,
+        timelimit=20,
+        rabbit_storage_gib=8154.0,
+    )
+    override = {
+        "version": 1,
+        "resources": [
+            {
+                "type": "slot",
+                "count": 1,
+                "label": "rabbit",
+                "with": [
+                    {
+                        "type": "node",
+                        "count": 1,
+                        "with": [
+                            {
+                                "type": "slot",
+                                "count": 1,
+                                "label": "task",
+                                "with": [{"type": "core", "count": 1}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "tasks": [{"command": ["hostname"], "slot": "task", "count": {"per_slot": 1}}],
+        "attributes": {"system": {"duration": 0}},
+    }
+
+    job.set_jobspec_override(override)
+
+    assert job.jobspec == override

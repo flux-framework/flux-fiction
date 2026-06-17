@@ -353,6 +353,9 @@ def build_inner_script(ff_root: Path, generated_config: Path, stampfile: str | N
     emergency_alloc_txt = output_dir / "emergency_allocations.txt"
     emergency_jobspecs = output_dir / "emergency_jobspecs.txt"
     emergency_flux_config = output_dir / "emergency_flux_config.json"
+    sample_jobs_path = output_dir / "sample_jobs.json"
+    sample_jobid_path = output_dir / "sample_jobid.txt"
+    sample_jobspec_path = output_dir / "sample_jobspec.json"
     args = [
         "flux-fiction",
         "--config_file",
@@ -521,6 +524,51 @@ done_path.write_text("ok\\n")
         done_path=str(emergency_done),
     )
 
+    python_capture_sample_jobspec = """
+import json
+import subprocess
+from pathlib import Path
+
+jobs_path = Path({jobs_path!r})
+jobid_path = Path({jobid_path!r})
+jobspec_path = Path({jobspec_path!r})
+
+jobs_proc = subprocess.run(
+    ["flux", "jobs", "-a", "--json"],
+    capture_output=True,
+    text=True,
+)
+if jobs_proc.returncode != 0:
+    raise SystemExit(jobs_proc.stderr or "flux jobs --json failed")
+
+jobs_path.write_text(jobs_proc.stdout, encoding="utf-8")
+payload = json.loads(jobs_proc.stdout)
+jobs = payload.get("jobs", [])
+if not jobs:
+    raise SystemExit("No jobs found in flux jobs --json output")
+
+job = jobs[0]
+jobid = str(job.get("jobid") or job.get("id") or "")
+if not jobid:
+    raise SystemExit("Could not determine jobid from flux jobs --json output")
+
+jobid_path.write_text(jobid + "\\n", encoding="utf-8")
+jobspec_proc = subprocess.run(
+    ["flux", "job", "info", jobid, "jobspec"],
+    capture_output=True,
+    text=True,
+)
+if jobspec_proc.returncode != 0:
+    raise SystemExit(jobspec_proc.stderr or f"flux job info {{jobid}} jobspec failed")
+
+jobspec_path.write_text(jobspec_proc.stdout, encoding="utf-8")
+print(jobid)
+""".format(
+        jobs_path=str(sample_jobs_path),
+        jobid_path=str(sample_jobid_path),
+        jobspec_path=str(sample_jobspec_path),
+    )
+
     return "\n".join([
         "set -euo pipefail",
         f"cd {shell_quote(ff_root)}",
@@ -557,6 +605,11 @@ done_path.write_text("ok\\n")
         "wait \"${fatal_watch_pid}\" 2>/dev/null || true",
         "if [[ -f \"${fatal_sentinel}\" ]]; then",
         "  emergency_dump || true",
+        "fi",
+        "if [[ \"${ff_rc}\" -eq 0 ]]; then",
+        "  python3 - <<'PY'",
+        python_capture_sample_jobspec.strip(),
+        "PY",
         "fi",
         "exit \"${ff_rc}\"",
     ])

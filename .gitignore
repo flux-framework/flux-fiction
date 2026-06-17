@@ -18,3 +18,4 @@ src/*.csv
 src/*.json
 /experiment_data/
 /test/
+/docs
