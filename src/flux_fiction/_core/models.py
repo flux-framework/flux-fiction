@@ -15,25 +15,16 @@ logger = logging.getLogger(__name__)
 
 TIME_QUANTUM = 1e-6
 
+
 def qtime(t) -> float:
     return round(float(t) / TIME_QUANTUM) * TIME_QUANTUM
 
-_event_seq_counter = 0
-
 def make_tagged_cb(kind, job, fn, time_value):
     """Wrap a callback so we can log its kind and identity later."""
-    global _event_seq_counter
-    seq = _event_seq_counter
-    _event_seq_counter += 1
-
     def cb():
         return fn()
 
-    # attach debug metadata to the function object
     cb._ev_kind = kind
-    cb._ev_time = time_value
-    cb._ev_seq_add = seq
-    cb._ev_jobid = getattr(job, "jobid", None) if job else None
     cb._ev_trace_idx = getattr(job, "trace_index", None) if job else None
     return cb
 
