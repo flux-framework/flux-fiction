@@ -246,29 +246,58 @@ def make_run_id(config_path: Path, tag: str | None) -> str:
 
 def unique_run_root(config_path: Path, run_dir: str | Path | None, tag: str | None) -> Path:
     if run_dir:
-        base = remap_path(run_dir, for_output=True)
-    else:
-        base = config_path.parent / "runs" / make_run_id(config_path, tag)
+        return remap_path(run_dir, for_output=True)
+    return config_path.parent / "runs" / make_run_id(config_path, tag)
+
+
+def create_run_root(config_path: Path, run_dir: str | Path | None, tag: str | None) -> Path:
+    base = unique_run_root(config_path, run_dir, tag)
+    if run_dir:
+        base.mkdir(parents=True, exist_ok=False)
+        return base
 
     candidate = base
     idx = 2
-    while candidate.exists():
-        candidate = Path(f"{base}_{idx}")
-        idx += 1
-    return candidate
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = Path(f"{base}_{idx}")
+            idx += 1
 
 
 def shell_quote(value: str | Path) -> str:
     return shlex.quote(str(value))
 
 
-def default_stampfile() -> str:
+def resolve_stampfile_path(
+    stampfile: str | None,
+    run_root: Path,
+) -> tuple[Path, str]:
+    if stampfile:
+        return remap_path(stampfile, for_output=True), "explicit"
+
     env_stamp = os.environ.get("STAMPFILE")
     if env_stamp:
-        return env_stamp
-    if Path("/host-tmp").exists():
-        return "/host-tmp/faketime_stamp"
-    return "/tmp/flux_fiction_faketime_stamp"
+        return remap_path(env_stamp, for_output=True), "environment"
+
+    return run_root / "faketime_stamp", "default"
+
+
+def warn_on_implicit_stampfile(path: Path, source: str) -> None:
+    if source == "environment":
+        print(
+            "WARNING: using faketime stamp file from inherited STAMPFILE environment variable: "
+            f"{path}",
+            file=sys.stderr,
+        )
+    elif source == "default":
+        print(
+            "WARNING: using default faketime stamp file inside the run directory: "
+            f"{path}",
+            file=sys.stderr,
+        )
 
 
 def default_faketime_lib() -> str:
@@ -545,8 +574,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--stampfile",
-        default=default_stampfile(),
-        help="Path to the libfaketime timestamp file.",
+        default=None,
+        help=(
+            "Path to the libfaketime timestamp file. Default: a unique "
+            "faketime_stamp file inside the run directory."
+        ),
     )
     parser.add_argument(
         "--no-faketime",
@@ -601,8 +633,7 @@ def main() -> int:
     if not source_config.exists():
         raise FileNotFoundError(f"Config TOML not found: {source_config}")
 
-    run_root = unique_run_root(source_config, args.run_dir, args.tag)
-    run_root.mkdir(parents=True, exist_ok=False)
+    run_root = create_run_root(source_config, args.run_dir, args.tag)
     status_path = run_root / "status.json"
     status = RunStatusWriter(status_path)
     status.update(
@@ -634,14 +665,20 @@ def main() -> int:
         run_root,
         otel=otel_cfg,
     )
-    status.update(
-        config_file=str(generated_config),
-        trace_file=str(trace_path),
-    )
 
     broker_log = run_root / "broker.log"
     stdout_log = run_root / "run.log"
-    stampfile = None if args.no_faketime else args.stampfile
+    stamp_path = None
+    stampfile_source = None
+    if not args.no_faketime:
+        stamp_path, stampfile_source = resolve_stampfile_path(args.stampfile, run_root)
+        warn_on_implicit_stampfile(stamp_path, stampfile_source)
+    stampfile = None if stamp_path is None else str(stamp_path)
+    status.update(
+        config_file=str(generated_config),
+        trace_file=str(trace_path),
+        faketime_timestamp_file=stampfile,
+    )
 
     env = os.environ.copy()
     configure_flux_env(env)
@@ -657,10 +694,10 @@ def main() -> int:
         if not args.dry_run and not faketime_lib.exists():
             raise FileNotFoundError(f"libfaketime not found: {faketime_lib}")
 
-        stamp_path = Path(args.stampfile)
         first_submit = first_submit_epoch(trace_path)
         initial_fake_time = first_submit - max(0.0, float(args.faketime_start_lead))
         if not args.dry_run:
+            assert stamp_path is not None
             stamp_path.parent.mkdir(parents=True, exist_ok=True)
             stamp_path.write_text(f"{initial_fake_time - time.time():+.9f}s\n")
 
@@ -723,7 +760,7 @@ def main() -> int:
     print(f"Broker log:       {broker_log}")
     print(f"Run log:          {stdout_log}")
     if not args.no_faketime:
-        print(f"Stamp file:       {args.stampfile}")
+        print(f"Stamp file:       {stampfile}")
         print(f"First submit:     {first_submit:.6f}")
         print(f"Faketime lead:    {max(0.0, float(args.faketime_start_lead)):.6f}s")
     if args.otel:
