@@ -8,7 +8,7 @@ from flux_fiction._core.faketime import FakeTimeController
 from flux_fiction._adapters.base import Adapter 
 import flux_fiction._outputs.filesystem_output as filesystem_output
 import flux_fiction._outputs.vis as output_vis
-from flux_fiction.api.status import RunStatusWriter
+from flux_fiction.api.status import RunStatusWriter, utcnow_iso
 from flux_fiction.telemetry import TelemetryClient
 
 from flux_fiction._exec.simexec import SimpleExec  
@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 class EngineResult:
     ok: bool
     message: str = ""
+
+
+def _write_summary_file(path: str | None, payload: dict) -> None:
+    if not path:
+        return
+    summary_path = Path(path)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 def run(
@@ -232,14 +243,39 @@ def run(
         if job.queue_wait is not None:
             waits.append(float(job.queue_wait))
 
+    avg_wait = None
     if waits:
         avg_wait = sum(waits) / len(waits)
         print(f"Average queue wait time: {avg_wait:.6f} seconds (sim time) over {len(waits)} jobs")
     else:
         print("Average queue wait time: N/A (no jobs have queue_wait recorded)")
 
+    max_wait = None
     if waits:
-        print(f"Max queue wait time: {max(waits):.6f} seconds (sim time)")
+        max_wait = max(waits)
+        print(f"Max queue wait time: {max_wait:.6f} seconds (sim time)")
+
+    summary_payload = {
+        "version": 1,
+        "state": "succeeded",
+        "generated_at": utcnow_iso(),
+        "output_dir": config.output_dir,
+        "config_file": getattr(config, "config_file", None),
+        "source_config_file": getattr(config, "source_config_file", None),
+        "trace_file": getattr(config, "job_traces", None),
+        "jobs_total": int(simulation.jobs_total),
+        "jobs_completed": int(simulation.num_complete),
+        "makespan_seconds": float(makespan),
+        "makespan_hours": float(makespan) / 3600.0,
+        "avg_queue_wait_seconds": None if avg_wait is None else float(avg_wait),
+        "max_queue_wait_seconds": None if max_wait is None else float(max_wait),
+        "kvs_size_start_bytes": int(kvs_size_start),
+        "kvs_size_end_bytes": int(kvs_size_end),
+        "kvs_bytes_per_completed_job": float(kvs_bytes_per_completed),
+        "kvs_growth_bytes_per_sim_s": float(kvs_growth_bytes_per_sim_s),
+        "resource_summary": resource_summary,
+    }
+    _write_summary_file(getattr(config, "summary_file", None), summary_payload)
 
     return EngineResult(ok=True, message="Ran Successfully")
 

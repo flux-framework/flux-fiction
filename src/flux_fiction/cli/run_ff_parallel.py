@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
-from flux_fiction.parallel import ParallelValidationError, load_parallel_manifest, resolve_parallel_plan
+from flux_fiction.parallel import (
+    ParallelValidationError,
+    load_parallel_manifest,
+    resolve_parallel_plan,
+    run_parallel_plan,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit the resolved dry-run plan as JSON.",
     )
+    parser.add_argument(
+        "--show-makespan-extremes",
+        action="store_true",
+        help="Include the shortest and longest successful makespans in the final console summary.",
+    )
     return parser
 
 
@@ -86,6 +95,8 @@ def _print_text_plan(plan) -> None:
             print(f"  tag:               {run.tag}")
         print(f"  no_faketime:       {run.no_faketime}")
         print(f"  broker_log_level:  {run.broker_log_level}")
+        if run.config_overrides:
+            print(f"  config_overrides:  {run.config_overrides}")
         print(f"  run_root:          {run.run_root}")
         print(f"  child_run_dir:     {run.child_run_dir}")
         print(f"  stampfile:         {run.stampfile}")
@@ -121,12 +132,13 @@ def main(argv: list[str] | None = None) -> int:
         print("Dry run requested; not launching child runs.")
         return 0
 
-    print(
-        "Parallel execution is not implemented yet in Phase 3. Use --dry-run to validate "
-        "manifests and inspect the launch plan.",
-        file=sys.stderr,
-    )
-    return 2
+    result = run_parallel_plan(plan, show_makespan_extremes=args.show_makespan_extremes)
+    print("")
+    print(f"Parallel status:   {result.status_path}")
+    print(f"Parallel summary:  {result.summary_path}")
+    print(f"Manifest snapshot: {result.manifest_snapshot_path}")
+    print(f"Return code:       {result.return_code}")
+    return result.return_code
 
 
 if __name__ == "__main__":

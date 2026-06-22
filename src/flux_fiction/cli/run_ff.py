@@ -367,6 +367,7 @@ def prepare_config(
     cfg["output_dir"] = str(output_dir) + "/"
     cfg["log_file"] = str(run_root / "emu.log")
     cfg["status_file"] = str(run_root / "status.json")
+    cfg["summary_file"] = str(run_root / "summary.json")
     cfg["source_config_file"] = str(source_config)
     if otel:
         cfg.update(otel)

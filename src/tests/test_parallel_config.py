@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+import re
 
 import pytest
 
@@ -114,12 +116,15 @@ config_file = "./config.toml"
 
     assert plan.max_concurrent == 3
     assert len(plan.runs) == 1
+    assert re.search(r"/planned-output/\d{8}_\d{6}_manifest(?:_\d+)?$", plan.output_root)
     run = plan.runs[0]
+    run_root = Path(run.run_root)
     assert run.no_faketime is True
     assert run.broker_log_level == 9
-    assert run.run_root.endswith("/runs/0001_alpha-run")
-    assert run.child_run_dir.endswith("/runs/0001_alpha-run/child")
-    assert run.stampfile.endswith("/runs/0001_alpha-run/child/faketime_stamp")
+    assert run_root.parent == Path(plan.output_root) / "runs"
+    assert run_root.name == "0001_alpha-run"
+    assert run.child_run_dir == str(run_root / "child")
+    assert run.stampfile == str(run_root / "child" / "faketime_stamp")
 
 
 def test_resolve_parallel_plan_supports_sharding(tmp_path):
@@ -152,6 +157,95 @@ config_file = "./config.toml"
     plan = resolve_parallel_plan(manifest, shard_index=1, shard_count=2)
 
     assert [run.name for run in plan.runs] == ["run-b"]
+    assert "shard-2-of-2" in plan.output_root
+
+
+def test_resolve_parallel_plan_avoids_existing_execution_root(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
+    manifest_path = _write_manifest(
+        tmp_path / "manifest.toml",
+        """
+version = 1
+
+[parallel]
+max_concurrent = 1
+output_root = "./parallel-out"
+
+[[run]]
+name = "alpha"
+config_file = "./config.toml"
+""".strip()
+        + "\n",
+    )
+    manifest = load_parallel_manifest(manifest_path)
+    monkeypatch.setattr(
+        "flux_fiction.parallel.config._make_parallel_run_id",
+        lambda *_args, **_kwargs: "20260621_120000_manifest",
+    )
+
+    first = resolve_parallel_plan(manifest)
+    Path(first.output_root).mkdir(parents=True)
+    second = resolve_parallel_plan(manifest)
+
+    assert first.output_root.endswith("/parallel-out/20260621_120000_manifest")
+    assert second.output_root.endswith("/parallel-out/20260621_120000_manifest_2")
+
+
+def test_load_parallel_manifest_accepts_serial_config_overrides(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
+    manifest_path = _write_manifest(
+        tmp_path / "manifest.toml",
+        """
+version = 1
+
+[parallel]
+max_concurrent = 1
+
+[[run]]
+name = "alpha"
+config_file = "./config.toml"
+account_system_latency = false
+backend = "mock"
+quiet = true
+rabbit_storage_emit_dw = false
+rabbit_storage_name = "rabbitxfs"
+""".strip()
+        + "\n",
+    )
+
+    manifest = load_parallel_manifest(manifest_path)
+
+    overrides = manifest.run[0].config_overrides
+    assert overrides["account_system_latency"] is False
+    assert overrides["backend"] == "mock"
+    assert overrides["quiet"] is True
+    assert overrides["rabbit_storage_emit_dw"] is False
+    assert overrides["rabbit_storage_name"] == "rabbitxfs"
+
+
+def test_load_parallel_manifest_rejects_unknown_run_override_field(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
+    manifest_path = _write_manifest(
+        tmp_path / "manifest.toml",
+        """
+version = 1
+
+[parallel]
+max_concurrent = 1
+
+[[run]]
+name = "alpha"
+config_file = "./config.toml"
+definitely_not_a_real_field = 123
+""".strip()
+        + "\n",
+    )
+
+    with pytest.raises(ParallelValidationError, match="Unsupported run override field"):
+        load_parallel_manifest(manifest_path)
 
 
 def test_run_ff_parallel_dry_run_prints_plan(tmp_path, capsys):
@@ -180,7 +274,7 @@ config_file = "./config.toml"
     assert "Dry run requested; not launching child runs." in captured.out
 
 
-def test_run_ff_parallel_requires_dry_run_in_phase3(tmp_path, capsys):
+def test_run_ff_parallel_executes_runner_and_prints_result_paths(tmp_path, capsys, monkeypatch):
     config = tmp_path / "config.toml"
     config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
     manifest_path = _write_manifest(
@@ -198,8 +292,18 @@ config_file = "./config.toml"
         + "\n",
     )
 
+    fake_result = SimpleNamespace(
+        return_code=0,
+        status_path=tmp_path / "parallel_status.json",
+        summary_path=tmp_path / "parallel_summary.json",
+        manifest_snapshot_path=tmp_path / "manifest.snapshot.toml",
+    )
+    monkeypatch.setattr(run_ff_parallel, "run_parallel_plan", lambda plan, **kwargs: fake_result)
+
     rc = run_ff_parallel.main([str(manifest_path)])
 
     captured = capsys.readouterr()
-    assert rc == 2
-    assert "Parallel execution is not implemented yet in Phase 3" in captured.err
+    assert rc == 0
+    assert "Parallel status:" in captured.out
+    assert "Parallel summary:" in captured.out
+    assert "Manifest snapshot:" in captured.out

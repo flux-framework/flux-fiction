@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
+from flux_fiction.api.config import ExperimentConfigModel
 
 try:
     from pydantic import ConfigDict, model_validator
@@ -63,6 +65,95 @@ def _slugify(name: str) -> str:
     return slug or "run"
 
 
+def _make_parallel_run_id(
+    manifest_path: str | os.PathLike[str],
+    *,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
+) -> str:
+    manifest = Path(manifest_path)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pieces = [stamp, _slugify(manifest.stem)]
+    if shard_index is not None and shard_count is not None:
+        pieces.append(f"shard-{shard_index + 1}-of-{shard_count}")
+    return "_".join(piece for piece in pieces if piece)
+
+
+def _unique_parallel_output_root(
+    base_output_root: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    *,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
+) -> Path:
+    base = Path(base_output_root).expanduser().resolve()
+    run_id = _make_parallel_run_id(
+        manifest_path,
+        shard_index=shard_index,
+        shard_count=shard_count,
+    )
+    candidate = base / run_id
+    idx = 2
+    while candidate.exists():
+        candidate = base / f"{run_id}_{idx}"
+        idx += 1
+    return candidate
+
+
+def _model_field_names(model_cls: type[BaseModel]) -> set[str]:
+    if hasattr(model_cls, "model_fields"):
+        return set(model_cls.model_fields)
+    return set(model_cls.__fields__)
+
+
+_PARALLEL_RUN_KNOWN_FIELDS = {
+    "name",
+    "config_file",
+    "job_traces",
+    "config_json",
+    "resource_file",
+    "resource_R",
+    "tag",
+    "no_faketime",
+    "broker_log_level",
+    "metadata",
+}
+
+_RUN_OVERRIDE_BLOCKED_FIELDS = {
+    "config_file",
+    "source_config_file",
+    "output_dir",
+    "log_file",
+    "status_file",
+    "summary_file",
+    "faketime_timestamp_file",
+}
+
+_RUN_OVERRIDE_INPUT_PATH_FIELDS = {
+    "raw_jobspec_file",
+}
+
+_RUN_OVERRIDE_ALLOWED_FIELDS = (
+    _model_field_names(ExperimentConfigModel)
+    - _RUN_OVERRIDE_BLOCKED_FIELDS
+    - {"job_traces", "config_json", "resource_file", "resource_R"}
+)
+
+
+def _extra_items(model: BaseModel) -> dict[str, Any]:
+    if hasattr(model, "model_extra") and model.model_extra is not None:
+        return dict(model.model_extra)
+    return {
+        key: value
+        for key, value in model.__dict__.items()
+        if key not in _PARALLEL_RUN_KNOWN_FIELDS
+    }
+
+
+def _invalid_run_override_fields(extra: dict[str, Any]) -> list[str]:
+    return sorted(key for key in extra if key not in _RUN_OVERRIDE_ALLOWED_FIELDS)
+
+
 @dataclass(frozen=True)
 class ParallelSettings:
     max_concurrent: int = 1
@@ -86,6 +177,7 @@ class ParallelRun:
     no_faketime: Optional[bool] = None
     broker_log_level: Optional[int] = None
     metadata: Optional[dict[str, Any]] = None
+    config_overrides: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +202,7 @@ class ParallelRunPlan:
     no_faketime: bool
     broker_log_level: int
     metadata: dict[str, Any]
+    config_overrides: dict[str, Any]
     run_root: str
     child_run_dir: str
     stampfile: str
@@ -151,6 +244,7 @@ class ResolvedParallelPlan:
                     "no_faketime": run.no_faketime,
                     "broker_log_level": run.broker_log_level,
                     "metadata": run.metadata,
+                    "config_overrides": run.config_overrides,
                     "run_root": run.run_root,
                     "child_run_dir": run.child_run_dir,
                     "stampfile": run.stampfile,
@@ -194,10 +288,10 @@ class ParallelSettingsModel(BaseModel):
 
 class ParallelRunModel(BaseModel):
     if _PYDANTIC_V2:
-        model_config = ConfigDict(extra="forbid")
+        model_config = ConfigDict(extra="allow")
     else:
         class Config:
-            extra = "forbid"
+            extra = "allow"
 
     name: str
     config_file: str
@@ -217,6 +311,11 @@ class ParallelRunModel(BaseModel):
                 raise ValueError("run name must not be empty")
             if self.resource_file and self.resource_R:
                 raise ValueError("Use only one of resource_file or resource_R.")
+            invalid = _invalid_run_override_fields(_extra_items(self))
+            if invalid:
+                raise ValueError(
+                    "Unsupported run override field(s): {}".format(", ".join(invalid))
+                )
             return self
     else:
         @root_validator(skip_on_failure=True)
@@ -225,6 +324,17 @@ class ParallelRunModel(BaseModel):
                 raise ValueError("run name must not be empty")
             if values.get("resource_file") and values.get("resource_R"):
                 raise ValueError("Use only one of resource_file or resource_R.")
+            invalid = _invalid_run_override_fields(
+                {
+                    key: value
+                    for key, value in values.items()
+                    if key not in _PARALLEL_RUN_KNOWN_FIELDS
+                }
+            )
+            if invalid:
+                raise ValueError(
+                    "Unsupported run override field(s): {}".format(", ".join(invalid))
+                )
             return values
 
 
@@ -304,6 +414,9 @@ def load_parallel_manifest(path: str | os.PathLike[str]) -> ParallelManifest:
         for key in ("config_file", "job_traces", "config_json", "resource_file", "resource_R"):
             if run_data.get(key):
                 run_data[key] = _resolve_input_path(str(run_data[key]), manifest_dir=manifest_dir)
+        for key in _RUN_OVERRIDE_INPUT_PATH_FIELDS:
+            if run_data.get(key):
+                run_data[key] = _resolve_input_path(str(run_data[key]), manifest_dir=manifest_dir)
         runs_data.append(run_data)
 
     validated = _validate_manifest(
@@ -317,7 +430,17 @@ def load_parallel_manifest(path: str | os.PathLike[str]) -> ParallelManifest:
     return ParallelManifest(
         version=int(validated_data["version"]),
         parallel=ParallelSettings(**validated_data["parallel"]),
-        run=[ParallelRun(**entry) for entry in validated_data["run"]],
+        run=[
+            ParallelRun(
+                **{key: entry.get(key) for key in _PARALLEL_RUN_KNOWN_FIELDS},
+                config_overrides={
+                    key: value
+                    for key, value in entry.items()
+                    if key not in _PARALLEL_RUN_KNOWN_FIELDS
+                },
+            )
+            for entry in validated_data["run"]
+        ],
         manifest_path=str(manifest_path),
     )
 
@@ -341,10 +464,16 @@ def resolve_parallel_plan(
     if shard_index is not None and (shard_index < 0 or shard_index >= int(shard_count)):
         raise ParallelValidationError("shard_index must satisfy 0 <= shard_index < shard_count")
 
-    effective_output_root = (
+    base_output_root = (
         Path(output_root).expanduser().resolve()
         if output_root is not None
         else Path(manifest.parallel.output_root).expanduser().resolve()
+    )
+    effective_output_root = _unique_parallel_output_root(
+        base_output_root,
+        manifest.manifest_path,
+        shard_index=shard_index,
+        shard_count=shard_count,
     )
     effective_max_concurrent = int(max_concurrent or manifest.parallel.max_concurrent)
     effective_fail_fast = manifest.parallel.fail_fast if fail_fast is None else bool(fail_fast)
@@ -386,6 +515,7 @@ def resolve_parallel_plan(
                     else int(run.broker_log_level)
                 ),
                 metadata=dict(run.metadata or {}),
+                config_overrides=dict(run.config_overrides or {}),
                 run_root=str(run_root),
                 child_run_dir=str(child_run_dir),
                 stampfile=str(stampfile),

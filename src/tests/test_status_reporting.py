@@ -21,6 +21,8 @@ from flux_fiction._adapters.mock.adapter import MockAdapter
 from flux_fiction._core.engine import Simulation
 from flux_fiction._core.events import EventList
 from flux_fiction._core.models import Job
+from flux_fiction.api import client
+from flux_fiction.api.config import ExperimentConfig
 from flux_fiction.api.status import RunStatusWriter
 
 
@@ -64,3 +66,35 @@ def test_status_snapshot_tracks_submitted_started_and_completed(tmp_path: Path):
     assert payload["jobs_completed"] == 1
     assert payload["time_step"] >= 2
     assert payload["current_sim_time"] == 1.0
+
+
+def test_engine_writes_summary_file(tmp_path: Path):
+    trace_path = tmp_path / "trace.csv"
+    trace_path.write_text(
+        "JobID,NNodes,NCPUS,Timelimit,Submit,Elapsed\n"
+        "1,1,1,00:10:00,2019-01-01T00:00:00,00:00:01\n",
+        encoding="utf-8",
+    )
+    summary_path = tmp_path / "summary.json"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    cfg = ExperimentConfig(
+        job_traces=str(trace_path),
+        nnodes=1,
+        ncpus=1,
+        ngpus=0,
+        backend="mock",
+        quiet=True,
+        output_dir=str(output_dir) + "/",
+        summary_file=str(summary_path),
+    )
+
+    result = client.run_experiment(cfg, adapter=MockAdapter())
+
+    assert result.ok
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "succeeded"
+    assert payload["jobs_total"] == 1
+    assert payload["jobs_completed"] == 1
+    assert payload["makespan_seconds"] >= 0.0
+    assert "resource_summary" in payload

@@ -290,8 +290,11 @@ Important notes:
 
 - `util/run_ff.py` remains as a source-tree compatibility wrapper around the
   installed `flux-fiction-run` harness.
-- `flux-fiction-run-parallel` currently provides Phase 3 manifest validation and
-  dry-run planning for future parallel execution work.
+- `flux-fiction-run-parallel` now supports manifest validation, dry-run launch
+  planning, bounded local child-run execution, periodic aggregate progress
+  updates, and final parent status/summary artifacts. Use
+  `--show-makespan-extremes` to include the shortest and longest successful
+  makespans in the final console summary.
 - `load_jobtap.sh` will load the local build artifact or the installed plugin
   path helper.
 - `load_jobtap.sh` now prefers an already prepared Flux environment and only

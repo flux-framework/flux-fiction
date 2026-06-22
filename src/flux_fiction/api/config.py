@@ -30,6 +30,7 @@ _PATH_FIELDS = {
     "output_dir": True,
     "log_file": True,
     "status_file": True,
+    "summary_file": True,
     "faketime_timestamp_file": True,
     "otel_bridge_socket": True,
     "otel_summary_file": True,
@@ -145,6 +146,7 @@ class ExperimentConfig:
     log_level: int = 10
     log_file: Optional[str] = None
     status_file: Optional[str] = None
+    summary_file: Optional[str] = None
 
     exclusive: bool = False
     quiet: bool = False
@@ -195,6 +197,7 @@ class ExperimentConfigModel(BaseModel):
     log_level: int = Field(default=10, ge=0)
     log_file: Optional[str] = None
     status_file: Optional[str] = None
+    summary_file: Optional[str] = None
 
     exclusive: bool = False
     quiet: bool = False
