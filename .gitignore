@@ -20,3 +20,4 @@ src/*.json
 /test/
 /docs
 /src/runs
+/tmp

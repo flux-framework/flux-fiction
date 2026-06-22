@@ -40,6 +40,7 @@ otel = [
 [project.scripts]
 flux-fiction = "flux_fiction.cli.main:main"
 flux-fiction-run = "flux_fiction.cli.run_ff:main"
+flux-fiction-run-parallel = "flux_fiction.cli.run_ff_parallel:main"
 flux-fiction-jobtap-path = "flux_fiction.cli.jobtap_path:main"
 
 [tool.pytest.ini_options]

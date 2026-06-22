@@ -290,6 +290,8 @@ Important notes:
 
 - `util/run_ff.py` remains as a source-tree compatibility wrapper around the
   installed `flux-fiction-run` harness.
+- `flux-fiction-run-parallel` currently provides Phase 3 manifest validation and
+  dry-run planning for future parallel execution work.
 - `load_jobtap.sh` will load the local build artifact or the installed plugin
   path helper.
 - `load_jobtap.sh` now prefers an already prepared Flux environment and only
@@ -300,6 +302,8 @@ Important notes:
   the run-local default path.
 - The preferred development path is the Podman container because it keeps Flux,
   scheduler, Python, and native dependencies aligned.
+- A reusable sample manifest lives at
+  `tmp/parallel-runner-sample/manifest.toml`.
 
 ## Auspices
 
