@@ -290,10 +290,23 @@ Important notes:
 
 - `util/run_ff.py` remains as a source-tree compatibility wrapper around the
   installed `flux-fiction-run` harness.
+- `flux-fiction-run-parallel` now supports manifest validation, dry-run launch
+  planning, bounded local child-run execution, periodic aggregate progress
+  updates, and final parent status/summary artifacts. Use
+  `--show-makespan-extremes` to include the shortest and longest successful
+  makespans in the final console summary.
 - `load_jobtap.sh` will load the local build artifact or the installed plugin
   path helper.
+- `load_jobtap.sh` now prefers an already prepared Flux environment and only
+  sources `/usr/local/bin/flux-dev-env.sh` as a fallback if `flux` is not
+  already available.
+- `flux-fiction-run` defaults faketime to a run-local `faketime_stamp` file and
+  warns when it uses either an inherited `STAMPFILE` environment variable or
+  the run-local default path.
 - The preferred development path is the Podman container because it keeps Flux,
   scheduler, Python, and native dependencies aligned.
+- A reusable sample manifest lives at
+  `tmp/parallel-runner-sample/manifest.toml`.
 
 ## Auspices
 

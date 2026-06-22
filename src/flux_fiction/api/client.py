@@ -1,42 +1,54 @@
 from __future__ import annotations
 
 from flux_fiction._core import engine
-import flux_fiction.api.config as config
+from flux_fiction._adapters.base import Adapter
+from flux_fiction.api.config import ExperimentConfig, from_cli_args, setup_logging
+from flux_fiction.api.status import RunStatusWriter
 
 import logging
 logger = logging.getLogger(__name__)
 
-def make_adapter(cfg):
-    try:
-        return _ADAPTERS[cfg.backend]()
-    except KeyError:
-        raise ValueError(f"Unknown backend {cfg.backend!r}. Choose from {list(_ADAPTERS)}")
+
+def make_adapter(cfg: ExperimentConfig) -> Adapter:
+    if cfg.backend == "flux":
+        from flux_fiction._adapters.flux.adapter import FluxAdapter
+        return FluxAdapter()
+    if cfg.backend == "mock":
+        from flux_fiction._adapters.mock.adapter import MockAdapter
+        return MockAdapter()
+    raise ValueError(f"Unknown backend {cfg.backend!r}")
 
 
-#TODO Make it where this will make in an args dict or possibly a ExperimentConfig object
-def run_experiment(args: dict) -> engine.EngineResult:
+def run_experiment(
+    cfg: ExperimentConfig,
+    *,
+    adapter: Adapter | None = None,
+    status: RunStatusWriter | None = None,
+) -> engine.EngineResult:
     '''
     run_experiment
     ---------------
-    
-    :param args: parsed command line arguments for a run of Flux Fiction
-    :type args: dict
+
+    :param cfg: validated configuration for a run of Flux Fiction
+    :type cfg: ExperimentConfig
     :return: Return code for a run of the experiment
     :rtype: EngineResult
 
     This function will use the core Flux Fiction library to execute a single experiment run.
     '''
-    cfg = config.from_cli_args(args)
-    config.setup_logging(level=cfg.log_level, log_file=cfg.log_file, quiet=cfg.quiet)
+    setup_logging(level=cfg.log_level, log_file=cfg.log_file, quiet=cfg.quiet)
+    adapter = adapter or make_adapter(cfg)
+    status = status or RunStatusWriter(cfg.status_file)
 
-    if cfg.backend == 'flux':
-        from flux_fiction._adapters.flux.adapter import FluxAdapter
-        adapter = FluxAdapter()
-    elif cfg.backend == 'mock':
-        from flux_fiction._adapters.mock.adapter import MockAdapter
-        adapter = MockAdapter()
-    else:
-        raise ValueError(f"Unknown backend {cfg.backend!r}")
-        
     logger.info(f"Running experiment with config: {cfg}")
-    return engine.run(cfg, adapter)
+    return engine.run(cfg, adapter, status=status)
+
+
+def run_experiment_from_args(args) -> engine.EngineResult:
+    '''
+    Backward-compatible helper for legacy CLI call sites.
+    New programmatic integrations should build an ExperimentConfig and call
+    run_experiment() directly.
+    '''
+    cfg = from_cli_args(args)
+    return run_experiment(cfg)

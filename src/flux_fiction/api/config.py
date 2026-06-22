@@ -22,12 +22,15 @@ logger = logging.getLogger(__name__)
 _PATH_FIELDS = {
     "job_traces": False,
     "config_file": False,
+    "source_config_file": False,
     "config_json": False,
     "raw_jobspec_file": False,
     "resource_file": False,
     "resource_R": False,
     "output_dir": True,
     "log_file": True,
+    "status_file": True,
+    "summary_file": True,
     "faketime_timestamp_file": True,
     "otel_bridge_socket": True,
     "otel_summary_file": True,
@@ -128,6 +131,7 @@ def _normalize_config_paths(data: dict) -> dict:
 class ExperimentConfig:
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
+    source_config_file: Optional[str] = None
     config_json: Optional[str] = None
     raw_jobspec_file: Optional[str] = None
 
@@ -141,6 +145,8 @@ class ExperimentConfig:
 
     log_level: int = 10
     log_file: Optional[str] = None
+    status_file: Optional[str] = None
+    summary_file: Optional[str] = None
 
     exclusive: bool = False
     quiet: bool = False
@@ -176,6 +182,7 @@ class ExperimentConfigModel(BaseModel):
 
     job_traces: Optional[str] = None
     config_file: Optional[str] = None
+    source_config_file: Optional[str] = None
     config_json: Optional[str] = None
     raw_jobspec_file: Optional[str] = None
 
@@ -189,6 +196,8 @@ class ExperimentConfigModel(BaseModel):
 
     log_level: int = Field(default=10, ge=0)
     log_file: Optional[str] = None
+    status_file: Optional[str] = None
+    summary_file: Optional[str] = None
 
     exclusive: bool = False
     quiet: bool = False

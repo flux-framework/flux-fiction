@@ -19,3 +19,5 @@ src/*.json
 /experiment_data/
 /test/
 /docs
+/src/runs
+/tmp

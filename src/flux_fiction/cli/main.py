@@ -1,3 +1,10 @@
+"""
+Legacy command-line shim for Flux Fiction.
+
+Keep new integrations on the API layer in `flux_fiction.api.client`.
+This module exists for backward-compatible CLI usage and should remain thin.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -64,7 +71,9 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    result = client.run_experiment(args)
+    # Intentionally route CLI execution through the legacy args wrapper.
+    # New code should prefer the API-level ExperimentConfig entrypoint.
+    result = client.run_experiment_from_args(args)
 
     if not result.ok:
         logger.critical(f"Run failed: {result.message}")

@@ -8,6 +8,7 @@ from flux_fiction._core.faketime import FakeTimeController
 from flux_fiction._adapters.base import Adapter 
 import flux_fiction._outputs.filesystem_output as filesystem_output
 import flux_fiction._outputs.vis as output_vis
+from flux_fiction.api.status import RunStatusWriter, utcnow_iso
 from flux_fiction.telemetry import TelemetryClient
 
 from flux_fiction._exec.simexec import SimpleExec  
@@ -19,6 +20,7 @@ import logging
 from collections import defaultdict
 import csv
 import time
+from pathlib import Path
 
 import json
 import os
@@ -34,7 +36,23 @@ class EngineResult:
     message: str = ""
 
 
-def run(config: object, adapter: Adapter) -> EngineResult:
+def _write_summary_file(path: str | None, payload: dict) -> None:
+    if not path:
+        return
+    summary_path = Path(path)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run(
+    config: object,
+    adapter: Adapter,
+    *,
+    status: RunStatusWriter | None = None,
+) -> EngineResult:
     """
     Core entrypoint. This will:
       - init Flux adapter
@@ -97,6 +115,10 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         otel_enabled=config.otel_enabled,
         otel_bridge_socket=config.otel_bridge_socket,
         otel_service_name=config.otel_service_name,
+        status=status or RunStatusWriter(getattr(config, "status_file", None)),
+        config_file=getattr(config, "config_file", None),
+        source_config_file=getattr(config, "source_config_file", None),
+        trace_file=config.job_traces,
     )
 
     adapter.open(simulation)
@@ -113,6 +135,8 @@ def run(config: object, adapter: Adapter) -> EngineResult:
     
     reader.validate_trace()
     jobs = list(reader.read_trace())
+    simulation.jobs_total = len(jobs)
+    simulation.write_status_snapshot(state="running")
 
     # exit(292)
     
@@ -219,14 +243,39 @@ def run(config: object, adapter: Adapter) -> EngineResult:
         if job.queue_wait is not None:
             waits.append(float(job.queue_wait))
 
+    avg_wait = None
     if waits:
         avg_wait = sum(waits) / len(waits)
         print(f"Average queue wait time: {avg_wait:.6f} seconds (sim time) over {len(waits)} jobs")
     else:
         print("Average queue wait time: N/A (no jobs have queue_wait recorded)")
 
+    max_wait = None
     if waits:
-        print(f"Max queue wait time: {max(waits):.6f} seconds (sim time)")
+        max_wait = max(waits)
+        print(f"Max queue wait time: {max_wait:.6f} seconds (sim time)")
+
+    summary_payload = {
+        "version": 1,
+        "state": "succeeded",
+        "generated_at": utcnow_iso(),
+        "output_dir": config.output_dir,
+        "config_file": getattr(config, "config_file", None),
+        "source_config_file": getattr(config, "source_config_file", None),
+        "trace_file": getattr(config, "job_traces", None),
+        "jobs_total": int(simulation.jobs_total),
+        "jobs_completed": int(simulation.num_complete),
+        "makespan_seconds": float(makespan),
+        "makespan_hours": float(makespan) / 3600.0,
+        "avg_queue_wait_seconds": None if avg_wait is None else float(avg_wait),
+        "max_queue_wait_seconds": None if max_wait is None else float(max_wait),
+        "kvs_size_start_bytes": int(kvs_size_start),
+        "kvs_size_end_bytes": int(kvs_size_end),
+        "kvs_bytes_per_completed_job": float(kvs_bytes_per_completed),
+        "kvs_growth_bytes_per_sim_s": float(kvs_growth_bytes_per_sim_s),
+        "resource_summary": resource_summary,
+    }
+    _write_summary_file(getattr(config, "summary_file", None), summary_payload)
 
     return EngineResult(ok=True, message="Ran Successfully")
 
@@ -253,17 +302,6 @@ def _finalize_failure(simulation):
         logger.exception("Error finalizing failure diagnostics")
     return simulation.failed_reason
 
-def log_event_execution(rows, header_written, output_dir = './'):
-    with open(f"{output_dir}event_order_log.csv", "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "time", "idx_in_bucket", "kind", "jobid", "trace_idx",
-            "insertion_seq", "real_ts"
-        ])
-        if not header_written:
-            w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
 class Simulation(object):
     '''
     Primary class for the emulator
@@ -287,6 +325,10 @@ class Simulation(object):
             otel_enabled: bool = False,
             otel_bridge_socket: str | None = None,
             otel_service_name: str = "flux-fiction",
+            status: RunStatusWriter | None = None,
+            config_file: str | None = None,
+            source_config_file: str | None = None,
+            trace_file: str | None = None,
     ):
         self.event_list = event_list
         self.job_map = job_map
@@ -311,7 +353,6 @@ class Simulation(object):
         self.batch_job_starts = bool(batch_job_starts)
         self.account_system_latency = bool(account_system_latency)
         self.jobtap_logging = bool(jobtap_logging)
-        self.event_log_header_written = False
         self.output_dir = output_dir
         self.faketime_controller = faketime_controller
         self.failed_reason = None
@@ -323,10 +364,35 @@ class Simulation(object):
         self.otel_service_name = otel_service_name
         self.quiescent_accumulation_window = 1.0
         self.pending_quiescent_expect = {"submits": 0, "finishes": 0}
+        self.num_started = 0
+        self.jobs_total = 0
+        self.status_writer = status or RunStatusWriter(None)
+        self.status_context = {
+            "run_dir": str(Path(output_dir).resolve().parent) if output_dir else None,
+            "config_file": config_file,
+            "source_config_file": source_config_file,
+            "trace_file": trace_file,
+        }
         self.telemetry = TelemetryClient(
             otel_bridge_socket if self.otel_enabled else None,
             otel_service_name,
             "python-engine",
+        )
+
+    def write_status_snapshot(self, *, state: str | None = None, failure_reason: str | None = None):
+        if not self.status_writer.enabled:
+            return
+        self.status_writer.update(
+            state=state,
+            failure_reason=failure_reason,
+            jobs_total=int(self.jobs_total),
+            jobs_submitted=int(self.num_submits),
+            jobs_running=max(0, int(self.num_started) - int(self.num_complete)),
+            jobs_completed=int(self.num_complete),
+            jobs_started=int(self.num_started),
+            current_sim_time=float(self.current_time),
+            time_step=int(self.time_step),
+            **self.status_context,
         )
 
     def _next_event_time(self):
@@ -510,6 +576,7 @@ class Simulation(object):
             self.failed_reason = message
 
         logger.critical("%s", self.failed_reason)
+        self.write_status_snapshot(state="failed", failure_reason=self.failed_reason)
         try:
             self.adapter.stop_reactor()
         except Exception:
@@ -791,6 +858,7 @@ class Simulation(object):
 
         self.final_quiescence_probe_sent = False
         job.real_start = time.time()
+        self.num_started += 1
         with self.telemetry.span(
             "simulation.start_job",
             jobid=jobid,
@@ -893,6 +961,7 @@ class Simulation(object):
                 else:
                     logger.info(f"completes {self.num_complete} submits {self.num_submits}")
                     logger.info("No more events in event list, running post-sim analysis")
+                    self.write_status_snapshot(state="running")
                     self.post_verification()
                     logger.info("Ending simulation")
                     self.adapter.stop_reactor()
@@ -900,26 +969,6 @@ class Simulation(object):
             logger.info("Fast-forwarding time to {}".format(self.current_time))
             if self.faketime_controller is not None:
                 self.faketime_controller.advance_to(self.current_time)
-
-            # record execution order exactly as it will happen
-            _exec_rows = []
-            for i, cb in enumerate(events_at_time):
-                kind = getattr(cb, "_ev_kind", "other")
-                jobid = getattr(cb, "_ev_jobid", None)
-                trace_idx = getattr(cb, "_ev_trace_idx", None)
-                ins_seq = getattr(cb, "_ev_seq_add", None)
-                _exec_rows.append({
-                    "time": f"{float(self.current_time):.6f}",
-                    "idx_in_bucket": i,
-                    "kind": kind,
-                    "jobid": jobid,
-                    "trace_idx": trace_idx,
-                    "insertion_seq": ins_seq,
-                    "real_ts": f"{time.time():.6f}",
-                })
-
-            log_event_execution(_exec_rows, self.event_log_header_written, self.output_dir)
-            self.event_log_header_written = True
 
             has_submits = any(getattr(cb, "_ev_kind", "") == "submit" for cb in events_at_time)
             if has_submits and self.faketime_controller is None:
@@ -963,6 +1012,7 @@ class Simulation(object):
             if self.time_step == 0:
                 print("")
             self.time_step += 1
+            self.write_status_snapshot(state="running")
 
             expect = self.step_expect.get(self.current_time, {"submits": 0, "finishes": 0})
             self._add_pending_quiescent_expect(expect)

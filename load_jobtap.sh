@@ -9,12 +9,14 @@ case "$-" in
         ;;
 esac
 
-if [[ -f /usr/local/bin/flux-dev-env.sh ]]; then
-    source /usr/local/bin/flux-dev-env.sh
-elif [[ -n "${FLUX_PREFIX:-}" ]]; then
+if [[ -n "${FLUX_PREFIX:-}" ]]; then
     export PATH="${FLUX_PREFIX}/bin:${PATH}"
     export LD_LIBRARY_PATH="${FLUX_PREFIX}/lib:${FLUX_PREFIX}/lib64:${LD_LIBRARY_PATH:-}"
     export PKG_CONFIG_PATH="${FLUX_PREFIX}/lib/pkgconfig:${FLUX_PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+fi
+
+if ! command -v flux >/dev/null 2>&1 && [[ -f /usr/local/bin/flux-dev-env.sh ]]; then
+    source /usr/local/bin/flux-dev-env.sh
 fi
 
 if [[ "${_load_jobtap_nounset}" -eq 1 ]]; then
