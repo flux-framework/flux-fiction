@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import signal
 import sys
+import threading
+import time
 
 from flux_fiction.parallel import load_parallel_manifest, prepare_parallel_run, resolve_parallel_plan, run_parallel_plan
 
@@ -216,6 +220,97 @@ makespan_s = 3.0
     states = {run["name"]: run["state"] for run in status["runs"]}
     assert states["fail-first"] == "failed"
     assert states["skip-second"] == "skipped"
+
+
+def test_run_parallel_plan_fail_fast_interrupts_active_runs(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
+    manifest_path = _write_manifest(
+        tmp_path / "manifest.toml",
+        """
+version = 1
+
+[parallel]
+max_concurrent = 2
+fail_fast = true
+output_root = "./parallel-output"
+
+[[run]]
+name = "fail-first"
+config_file = "./config.toml"
+
+[run.metadata]
+expected_rc = 1
+sleep_s = 0.01
+makespan_s = 15.0
+
+[[run]]
+name = "long-running"
+config_file = "./config.toml"
+
+[run.metadata]
+expected_rc = 0
+sleep_s = 5.0
+makespan_s = 30.0
+""".strip()
+        + "\n",
+    )
+    manifest = load_parallel_manifest(manifest_path)
+    plan = resolve_parallel_plan(manifest)
+
+    result = run_parallel_plan(plan, poll_interval=0.01, command_builder=_success_or_fail_command)
+
+    assert result.return_code == 1
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    states = {run["name"]: run["state"] for run in status["runs"]}
+    long_run = next(run for run in status["runs"] if run["name"] == "long-running")
+    assert states["fail-first"] == "failed"
+    assert states["long-running"] == "interrupted"
+    assert "fail_fast" in str(long_run.get("failure_reason") or "")
+
+
+def test_run_parallel_plan_interrupts_active_runs_on_sigint(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("[flux_fiction]\njob_traces = \"trace.csv\"\n", encoding="ascii")
+    manifest_path = _write_manifest(
+        tmp_path / "manifest.toml",
+        """
+version = 1
+
+[parallel]
+max_concurrent = 1
+output_root = "./parallel-output"
+summary_interval = 100.0
+
+[[run]]
+name = "long-running"
+config_file = "./config.toml"
+
+[run.metadata]
+expected_rc = 0
+sleep_s = 5.0
+makespan_s = 30.0
+""".strip()
+        + "\n",
+    )
+    manifest = load_parallel_manifest(manifest_path)
+    plan = resolve_parallel_plan(manifest)
+
+    def send_sigint():
+        time.sleep(0.1)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    interrupter = threading.Thread(target=send_sigint, daemon=True)
+    interrupter.start()
+    result = run_parallel_plan(plan, poll_interval=0.01, command_builder=_success_or_fail_command)
+    interrupter.join(timeout=1)
+
+    assert result.return_code == 130
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    run = status["runs"][0]
+    assert status["state"] == "interrupted"
+    assert run["state"] == "interrupted"
+    assert "Interrupted by SIGINT" in str(run.get("failure_reason") or "")
 
 
 def test_run_parallel_plan_prints_periodic_summary(tmp_path, capsys):

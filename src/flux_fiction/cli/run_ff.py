@@ -784,6 +784,25 @@ def main() -> int:
     proc = None
     broker_watch = None
     detected_fatal_error: dict[str, str] = {}
+    interrupted_reason: str | None = None
+    previous_handlers: dict[int, Any] = {}
+
+    def _shutdown_children(reason: str) -> None:
+        nonlocal interrupted_reason
+        interrupted_reason = reason
+        if proc is not None:
+            _terminate_process_group(proc, signal.SIGTERM)
+
+    def _handle_signal(signum, _frame) -> None:
+        try:
+            signame = signal.Signals(signum).name
+        except Exception:
+            signame = f"signal {signum}"
+        _shutdown_children(f"Interrupted by {signame}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle_signal)
     try:
         status.update(state="launching_flux")
         if bridge_cmd is not None:
@@ -828,11 +847,15 @@ def main() -> int:
             broker_watch.start()
             assert proc.stdout is not None
             for line in proc.stdout:
+                if interrupted_reason is not None:
+                    break
                 f.write(line)
                 f.flush()
                 sys.stdout.write(line)
             proc.wait()
     finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
         if broker_watch is not None:
             broker_watch.join(timeout=1)
         if bridge_proc is not None:
@@ -871,6 +894,8 @@ def main() -> int:
         failure_reason = detected_fatal_error["message"]
     elif broker_errors:
         failure_reason = "Detected sched-fluxion-resource.err in broker log"
+    elif interrupted_reason is not None:
+        failure_reason = interrupted_reason
     if emergency_done.exists():
         print("Emergency diagnostics written:", file=sys.stderr)
         for path in emergency_files:
@@ -891,7 +916,7 @@ def main() -> int:
         if len(broker_errors) > 5:
             print(f"  ... {len(broker_errors) - 5} more matching lines", file=sys.stderr)
 
-    rc = proc.returncode or (1 if broker_errors else 0)
+    rc = proc.returncode or (1 if broker_errors or interrupted_reason is not None else 0)
     status.update(
         state="succeeded" if rc == 0 else "failed",
         finished_at=utcnow_iso(),

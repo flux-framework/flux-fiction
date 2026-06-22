@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -253,6 +255,7 @@ def _summarize_records(records: list[dict[str, Any]]) -> dict[str, int]:
         "succeeded": 0,
         "failed": 0,
         "skipped": 0,
+        "interrupted": 0,
     }
     for record in records:
         state = str(record.get("state") or "queued")
@@ -317,6 +320,7 @@ def _print_progress_summary(records: list[dict[str, Any]], *, started_at: str) -
         "Progress: "
         f"queued={counts['queued']} launching={counts['launching']} running={counts['running']} "
         f"succeeded={counts['succeeded']} failed={counts['failed']} skipped={counts['skipped']} "
+        f"interrupted={counts['interrupted']} "
         f"jobs={jobs_text} wall={elapsed_text}"
     )
 
@@ -355,6 +359,25 @@ def _print_final_run_summary(records: list[dict[str, Any]], *, show_makespan_ext
                 "Longest makespan:  "
                 f"{extremes['longest']['name']} ({extremes['longest']['makespan_seconds']:.1f}s)"
             )
+
+
+def _terminate_active_process(proc: subprocess.Popen[str], *, timeout: float = 5.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    proc.wait(timeout=timeout)
 
 
 def run_parallel_plan(
@@ -429,15 +452,24 @@ def run_parallel_plan(
 
     active: list[ActiveParallelRun] = []
     pending = list(prepared_runs)
+    record_by_name = {record["name"]: record for record in run_records}
     failure_seen = False
     last_summary_print = 0.0
+    interrupted_reason: str | None = None
+    stop_requests: dict[str, dict[str, str]] = {}
+    fail_fast_applied = False
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous_handlers: dict[int, Any] = {}
+    shutdown_signal: dict[str, int | None] = {"signal": None}
 
     def refresh_parent_status(final_state: str | None = None) -> None:
         for idx, record in enumerate(run_records):
             child_status = _read_json_dict(Path(record["status_file"]))
             child_summary = _read_json_dict(Path(record["summary_file"]))
             updated = _snapshot_run_status(record, child_status)
-            run_records[idx] = _snapshot_run_summary(updated, child_summary)
+            refreshed = _snapshot_run_summary(updated, child_summary)
+            run_records[idx].clear()
+            run_records[idx].update(refreshed)
         counts = _summarize_records(run_records)
         status.update(
             state=final_state or "running",
@@ -446,22 +478,86 @@ def run_parallel_plan(
             **counts,
         )
 
+    def request_stop_for_pending(reason: str) -> None:
+        while pending:
+            prepared = pending.pop(0)
+            record = record_by_name[prepared.plan.name]
+            record["state"] = "skipped"
+            record["failure_reason"] = reason
+            record["finished_at"] = utcnow_iso()
+
+    def request_stop_for_active(reason: str, *, state: str) -> None:
+        for active_run in active:
+            name = active_run.prepared.plan.name
+            if name in stop_requests:
+                continue
+            stop_requests[name] = {"reason": reason, "state": state}
+            record = record_by_name[name]
+            record["failure_reason"] = reason
+            if plan.progress_mode == "summary":
+                print(
+                    f"Stopping  [{active_run.prepared.plan.ordinal:04d}] "
+                    f"{active_run.prepared.plan.name}: {reason}"
+                )
+            _terminate_active_process(active_run.proc)
+
+    def signal_name(signum: int | None) -> str:
+        if signum is None:
+            return "signal"
+        try:
+            return signal.Signals(signum).name
+        except Exception:
+            return f"signal {signum}"
+
+    def _request_interrupt(signum, _frame) -> None:
+        shutdown_signal["signal"] = int(signum)
+        nonlocal interrupted_reason
+        interrupted_reason = f"Interrupted by {signal_name(int(signum))}"
+
+    if main_thread:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_interrupt)
+
     try:
         while pending or active:
+            if interrupted_reason is not None:
+                failure_seen = True
+                request_stop_for_pending(interrupted_reason)
+                request_stop_for_active(interrupted_reason, state="interrupted")
+                refresh_parent_status(final_state="interrupted")
+
             while pending and len(active) < plan.max_concurrent and not (plan.fail_fast and failure_seen):
                 prepared = pending.pop(0)
-                record = next(item for item in run_records if item["name"] == prepared.plan.name)
+                record = record_by_name[prepared.plan.name]
                 record["state"] = "launching"
                 record["started_at"] = utcnow_iso()
-                log_handle = prepared.log_file.open("w", encoding="utf-8")
-                proc = subprocess.Popen(
-                    prepared.command,
-                    cwd=Path(plan.manifest_path).resolve().parents[0],
-                    env=os.environ.copy(),
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
+                log_handle = None
+                try:
+                    log_handle = prepared.log_file.open("w", encoding="utf-8")
+                    proc = subprocess.Popen(
+                        prepared.command,
+                        cwd=Path(plan.manifest_path).resolve().parents[0],
+                        env=os.environ.copy(),
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                except Exception as e:
+                    if log_handle is not None:
+                        log_handle.close()
+                    record["state"] = "failed"
+                    record["finished_at"] = utcnow_iso()
+                    record["return_code"] = 1
+                    record["failure_reason"] = f"Failed to launch child run: {e}"
+                    failure_seen = True
+                    if plan.progress_mode == "summary":
+                        print(
+                            f"Launch failed [{prepared.plan.ordinal:04d}] "
+                            f"{prepared.plan.name}: {e}"
+                        )
+                    refresh_parent_status()
+                    continue
                 record["pid"] = proc.pid
                 active.append(
                     ActiveParallelRun(
@@ -480,7 +576,7 @@ def run_parallel_plan(
                 rc = active_run.proc.poll()
                 if rc is None:
                     child_status = _read_json_dict(active_run.prepared.child_status_file)
-                    record = next(item for item in run_records if item["name"] == active_run.prepared.plan.name)
+                    record = record_by_name[active_run.prepared.plan.name]
                     if child_status.get("state") == "running":
                         record["state"] = "running"
                     continue
@@ -488,17 +584,23 @@ def run_parallel_plan(
                 completed_any = True
                 active.remove(active_run)
                 active_run.log_handle.close()
-                record = next(item for item in run_records if item["name"] == active_run.prepared.plan.name)
+                record = record_by_name[active_run.prepared.plan.name]
                 child_status = _read_json_dict(active_run.prepared.child_status_file)
-                final_state = "succeeded" if rc == 0 else "failed"
+                stop_request = stop_requests.get(active_run.prepared.plan.name)
+                if stop_request is not None and rc != 0:
+                    final_state = stop_request["state"]
+                else:
+                    final_state = "succeeded" if rc == 0 else "failed"
                 record["state"] = final_state
                 record["finished_at"] = utcnow_iso()
                 record["return_code"] = rc
-                if child_status.get("failure_reason"):
+                if stop_request is not None and not child_status.get("failure_reason"):
+                    record["failure_reason"] = stop_request["reason"]
+                elif child_status.get("failure_reason"):
                     record["failure_reason"] = child_status["failure_reason"]
                 if child_status.get("state") in {"failed", "succeeded"}:
                     record["child_state"] = child_status["state"]
-                if rc != 0:
+                if rc != 0 and stop_request is None:
                     failure_seen = True
                 if plan.progress_mode == "summary":
                     print(
@@ -508,11 +610,17 @@ def run_parallel_plan(
                 refresh_parent_status()
 
             if plan.fail_fast and failure_seen and pending:
-                while pending:
-                    prepared = pending.pop(0)
-                    record = next(item for item in run_records if item["name"] == prepared.plan.name)
-                    record["state"] = "skipped"
-                    record["failure_reason"] = "Skipped because fail_fast stopped new launches after a prior failure"
+                request_stop_for_pending(
+                    "Skipped because fail_fast stopped new launches after a prior failure"
+                )
+                refresh_parent_status()
+
+            if plan.fail_fast and failure_seen and active and not fail_fast_applied:
+                request_stop_for_active(
+                    "Terminated because fail_fast stopped the parallel run after a prior failure",
+                    state="interrupted",
+                )
+                fail_fast_applied = True
                 refresh_parent_status()
 
             if pending or active:
@@ -525,31 +633,30 @@ def run_parallel_plan(
                         last_summary_print = now
                 time.sleep(poll_interval)
     finally:
+        if main_thread:
+            for signum, previous in previous_handlers.items():
+                signal.signal(signum, previous)
         for active_run in active:
             if active_run.proc.poll() is None:
-                active_run.proc.terminate()
-                try:
-                    active_run.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    active_run.proc.kill()
-                    active_run.proc.wait(timeout=5)
+                _terminate_active_process(active_run.proc)
             active_run.log_handle.close()
 
-    refresh_parent_status(final_state="succeeded" if not failure_seen else "failed")
+    final_state = "interrupted" if interrupted_reason is not None else ("failed" if failure_seen else "succeeded")
+    refresh_parent_status(final_state=final_state)
     final_payload = status.read()
     final_payload["finished_at"] = utcnow_iso()
-    final_payload["state"] = "succeeded" if not failure_seen else "failed"
+    final_payload["state"] = final_state
     final_payload["makespan_extremes"] = _compute_makespan_extremes(run_records)
     _write_parallel_summary(summary_path, final_payload)
     status.update(
-        state=final_payload["state"],
+        state=final_state,
         finished_at=final_payload["finished_at"],
         makespan_extremes=final_payload["makespan_extremes"],
     )
     _print_final_run_summary(run_records, show_makespan_extremes=show_makespan_extremes)
 
     return ParallelExecutionResult(
-        return_code=0 if not failure_seen else 1,
+        return_code=130 if interrupted_reason is not None else (0 if not failure_seen else 1),
         status_path=status_path,
         summary_path=summary_path,
         manifest_snapshot_path=manifest_snapshot_path,
