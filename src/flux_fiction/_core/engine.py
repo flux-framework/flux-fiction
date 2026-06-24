@@ -457,69 +457,31 @@ class Simulation(object):
 
     def dump_scheduler_state(self, label=""):
         """
-        Query Flux for the state of all known jobs and dump to CSV.
+        Query the backend adapter for the state of all known jobs and dump to
+        CSV.
         """
-        import flux.job
-        
         rows = []
         for jobid, job in self.job_map.items():
             try:
-                # Use the lower-level job list API
-                from flux.job.list import get_job
-                jd = get_job(self.adapter._handle, int(jobid))
-                
-                if jd is None:
-                    jd = {}
-                
-                # Safely extract fields
-                def safe_get(d, key, default=""):
-                    try:
-                        val = d.get(key, default)
-                        if val is None:
-                            return default
-                        return val
-                    except Exception:
-                        return default
-                
-                # Try to serialize annotations safely
-                ann_str = ""
-                try:
-                    ann = safe_get(jd, "annotations", {})
-                    if hasattr(ann, "__dict__"):
-                        ann = vars(ann)
-                    if isinstance(ann, dict):
-                        # Recursively convert any non-serializable objects
-                        def make_serializable(obj):
-                            if hasattr(obj, "__dict__"):
-                                return vars(obj)
-                            if isinstance(obj, dict):
-                                return {k: make_serializable(v) for k, v in obj.items()}
-                            if isinstance(obj, (list, tuple)):
-                                return [make_serializable(v) for v in obj]
-                            return obj
-                        ann_str = json.dumps(make_serializable(ann))
-                    else:
-                        ann_str = str(ann)
-                except Exception as e:
-                    ann_str = f"parse_error: {e}"
-                
+                snapshot = self.adapter.get_scheduler_state(jobid)
+
                 rows.append({
                     "sim_time": f"{float(self.current_time):.6f}",
                     "label": label,
                     "jobid": jobid,
                     "trace_idx": getattr(job, "trace_index", ""),
                     "nnodes": job.nnodes,
-                    "state": safe_get(jd, "state", "?"),
+                    "state": snapshot.get("state", "?"),
                     "sim_submit": f"{float(job.submit_time):.6f}",
                     "sim_start": f"{float(job.start_time):.6f}" if job.start_time is not None else "",
                     "sim_complete": f"{float(job.complete_time):.6f}" if job.start_time is not None else "",
-                    "flux_t_submit": safe_get(jd, "t_submit", ""),
-                    "flux_t_run": safe_get(jd, "t_run", ""),
-                    "flux_t_cleanup": safe_get(jd, "t_cleanup", ""),
-                    "flux_expiration": safe_get(jd, "expiration", ""),
-                    "flux_duration": safe_get(jd, "duration", ""),
-                    "flux_nodelist": safe_get(jd, "nodelist", ""),
-                    "annotations": ann_str,
+                    "flux_t_submit": snapshot.get("flux_t_submit", ""),
+                    "flux_t_run": snapshot.get("flux_t_run", ""),
+                    "flux_t_cleanup": snapshot.get("flux_t_cleanup", ""),
+                    "flux_expiration": snapshot.get("flux_expiration", ""),
+                    "flux_duration": snapshot.get("flux_duration", ""),
+                    "flux_nodelist": snapshot.get("flux_nodelist", ""),
+                    "annotations": snapshot.get("annotations", ""),
                     "state_transitions": json.dumps({k: f"{v:.6f}" for k, v in job.state_transitions.items()}),
                 })
             except Exception as e:

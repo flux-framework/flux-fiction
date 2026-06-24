@@ -1,1 +1,1 @@
-from .engine import run
+"""Core simulation package."""

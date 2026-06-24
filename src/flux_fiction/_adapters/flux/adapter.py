@@ -227,6 +227,38 @@ class FluxAdapter:
 
         return diag
 
+    def get_scheduler_state(self, jobid):
+        lookup_jobid = _lookup_jobid(jobid)
+
+        try:
+            from flux.job.list import get_job
+
+            job_info = get_job(self._handle, lookup_jobid)
+            if job_info is None:
+                job_info = {}
+        except Exception as e:
+            return {"state": "ERROR", "error": repr(e)}
+
+        def safe_get(d, key, default=""):
+            try:
+                val = d.get(key, default)
+                if val is None:
+                    return default
+                return val
+            except Exception:
+                return default
+
+        return {
+            "state": safe_get(job_info, "state", "?"),
+            "flux_t_submit": safe_get(job_info, "t_submit", ""),
+            "flux_t_run": safe_get(job_info, "t_run", ""),
+            "flux_t_cleanup": safe_get(job_info, "t_cleanup", ""),
+            "flux_expiration": safe_get(job_info, "expiration", ""),
+            "flux_duration": safe_get(job_info, "duration", ""),
+            "flux_nodelist": safe_get(job_info, "nodelist", ""),
+            "annotations": _serialize_annotations(safe_get(job_info, "annotations", {})),
+        }
+
     def check_jobspec_satisfiability(self, jobspec_json):
         try:
             jobspec_obj = json.loads(jobspec_json)
@@ -333,6 +365,18 @@ def _make_serializable(obj):
     if hasattr(obj, "__dict__"):
         return _make_serializable(vars(obj))
     return str(obj)
+
+
+def _serialize_annotations(annotations):
+    try:
+        serializable = _make_serializable(annotations)
+        if isinstance(serializable, dict):
+            return json.dumps(serializable)
+        if serializable in (None, ""):
+            return ""
+        return str(serializable)
+    except Exception as e:
+        return f"parse_error: {e}"
 
 
 def _lookup_jobid(jobid):
