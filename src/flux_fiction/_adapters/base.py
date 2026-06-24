@@ -47,6 +47,9 @@ class Adapter(Protocol):
     def get_job_diagnostics(self, jobid: int) -> dict[str, Any]:
         '''Return best-effort scheduler/job-manager diagnostics for a job'''
 
+    def get_scheduler_state(self, jobid: int) -> dict[str, Any]:
+        '''Return a best-effort scheduler-facing state snapshot for a job'''
+
     def check_jobspec_satisfiability(self, jobspec_json: str) -> dict[str, Any]:
         '''Return best-effort scheduler satisfiability diagnostics for a jobspec'''
 

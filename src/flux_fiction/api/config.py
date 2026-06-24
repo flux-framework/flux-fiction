@@ -127,6 +127,12 @@ def _normalize_config_paths(data: dict) -> dict:
             normalized[key] = _rewrite_path(value, for_output=for_output)
     return normalized
 
+
+def _arg_value(args: Any, key: str, default: Any = None) -> Any:
+    if isinstance(args, dict):
+        return args.get(key, default)
+    return getattr(args, key, default)
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     job_traces: Optional[str] = None
@@ -297,7 +303,7 @@ def from_toml(args: dict) -> ExperimentConfig:
       - Top-level keys, or
       - A [flux_fiction] table.
     '''
-    cfg_path = _rewrite_path(args.config_file)
+    cfg_path = _rewrite_path(_arg_value(args, "config_file"))
     if not cfg_path:
         raise ValueError("from_toml called but args.config_file is missing")
     
@@ -312,7 +318,7 @@ def from_toml(args: dict) -> ExperimentConfig:
     merged["config_file"] = cfg_path
 
     # Optional override: CLI job_traces wins if provided
-    cli_job_traces = getattr(args, "job_traces", None) if not isinstance(args, dict) else args.get("job_traces")
+    cli_job_traces = _arg_value(args, "job_traces")
     if cli_job_traces is not None:
         merged["job_traces"] = cli_job_traces
 
@@ -333,7 +339,7 @@ def from_toml(args: dict) -> ExperimentConfig:
         "otel_bridge_log_file",
     ]
     for key in cli_overrides:
-        value = getattr(args, key, None) if not isinstance(args, dict) else args.get(key)
+        value = _arg_value(args, key)
         if value is not None:
             merged[key] = value
 

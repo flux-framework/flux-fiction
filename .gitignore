@@ -21,3 +21,6 @@ src/*.json
 /docs
 /src/runs
 /tmp
+.coverage
+.coverage.*
+htmlcov/
