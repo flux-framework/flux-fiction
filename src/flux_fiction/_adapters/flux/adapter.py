@@ -155,6 +155,22 @@ class FluxAdapter:
             
     def get_kvs_stats(self) -> dict:
         return stats.get_kvs_stats(self._handle)
+
+    def get_flux_module_stats(self, module_name: str) -> dict:
+        return stats.get_module_stats(self._handle, module_name)
+
+    def get_scheduler_metrics(self) -> dict:
+        metrics = {}
+        for key, method in (
+            ("qmanager_stats", "sched-fluxion-qmanager.stats-get"),
+            ("qmanager_params", "sched-fluxion-qmanager.params"),
+            ("resource_match_stats", "sched-fluxion-resource.stats-get"),
+        ):
+            try:
+                metrics[key] = _make_serializable(self._handle.rpc(method).get())
+            except Exception as e:
+                metrics[f"{key}_error"] = repr(e)
+        return metrics
     
     def query_quiescent(self, json_string, return_cb):
         logger.debug("Querying quiescent")
@@ -215,15 +231,7 @@ class FluxAdapter:
         except Exception as e:
             diag["queue_status_error"] = repr(e)
 
-        for key, method in (
-            ("qmanager_stats", "sched-fluxion-qmanager.stats-get"),
-            ("qmanager_params", "sched-fluxion-qmanager.params"),
-            ("resource_match_stats", "sched-fluxion-resource.stats-get"),
-        ):
-            try:
-                diag[key] = _make_serializable(self._handle.rpc(method).get())
-            except Exception as e:
-                diag[f"{key}_error"] = repr(e)
+        diag.update(self.get_scheduler_metrics())
 
         return diag
 
@@ -318,10 +326,37 @@ class FluxAdapter:
             return nodes, "flux_nodelist" if nodes else "missing"
         else:
             raise Exception("FluxAdapter.nodelist_lookup: flux handle is None")
+
+    def _submit_novalidate(self) -> bool:
+        return bool(getattr(self.simulation, "submit_novalidate", False))
         
     def submit_job(self, jobspec_json) -> int:
+        if self._submit_novalidate():
+            return flux.job.submit_async(
+                self._handle,
+                jobspec_json,
+                novalidate=True,
+            ).get_id()
         return flux.job.submit(self._handle, jobspec_json)
-                
+
+    def supports_async_submit(self) -> bool:
+        return True
+
+    def submit_job_async(self, jobspec_json):
+        # flux.job.submit() is submit_async() immediately followed by
+        # submit_get_id(), so it costs a full round-trip to the job manager for
+        # every job. Splitting the two lets a whole timestep's submissions be
+        # in flight at once; the ids are collected before the scheduler is told
+        # anything about them.
+        return flux.job.submit_async(
+            self._handle,
+            jobspec_json,
+            novalidate=self._submit_novalidate(),
+        )
+
+    def submit_get_id(self, handle) -> int:
+        return flux.job.submit_get_id(handle)
+
     def cancel_job(self, jobid):
         return flux.job.RAW.cancel(self._handle, jobid, "Canceled by emulator")
     

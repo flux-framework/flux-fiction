@@ -163,6 +163,19 @@ class ExperimentConfig:
     jobtap_logging: bool = False
     rabbit_storage_emit_dw: bool = False
     rabbit_storage_name: str = "rabbit"
+    # Pipeline job submissions: start every submission for a timestep before
+    # collecting any job id, instead of one blocking round-trip per job. Every
+    # id is collected before the scheduler is told what to expect, so the
+    # scheduler sees exactly the same jobs at the same logical time.
+    async_submit: bool = False
+    # Skip Flux job-ingest validation for internally generated jobspecs. This
+    # avoids the feasibility validator's extra Fluxion query per submitted job.
+    submit_novalidate: bool = False
+    # Render resource_utilization.png during post-processing. The underlying
+    # CSVs (resource_usage_timeseries.csv, resource_allocations.csv) are always
+    # written; this only controls the picture, which costs matplotlib time on
+    # every run and is dead weight across a large campaign.
+    make_plots: bool = True
 
     output_dir: Optional[str] = "./"
 
@@ -171,6 +184,7 @@ class ExperimentConfig:
     faketime_seed: bool = True
     faketime_tolerance: float = 1e-6
     faketime_near_event_threshold: float = 0.0
+    quiescent_accumulation_window: float = 0.0
     otel_enabled: bool = False
     otel_endpoint: str = "http://127.0.0.1:4318/v1/traces"
     otel_service_name: str = "flux-fiction"
@@ -214,6 +228,19 @@ class ExperimentConfigModel(BaseModel):
     jobtap_logging: bool = False
     rabbit_storage_emit_dw: bool = False
     rabbit_storage_name: str = "rabbit"
+    # Pipeline job submissions: start every submission for a timestep before
+    # collecting any job id, instead of one blocking round-trip per job. Every
+    # id is collected before the scheduler is told what to expect, so the
+    # scheduler sees exactly the same jobs at the same logical time.
+    async_submit: bool = False
+    # Skip Flux job-ingest validation for internally generated jobspecs. This
+    # avoids the feasibility validator's extra Fluxion query per submitted job.
+    submit_novalidate: bool = False
+    # Render resource_utilization.png during post-processing. The underlying
+    # CSVs (resource_usage_timeseries.csv, resource_allocations.csv) are always
+    # written; this only controls the picture, which costs matplotlib time on
+    # every run and is dead weight across a large campaign.
+    make_plots: bool = True
 
     output_dir: Optional[str] = "./"
 
@@ -222,6 +249,7 @@ class ExperimentConfigModel(BaseModel):
     faketime_seed: bool = True
     faketime_tolerance: float = Field(default=1e-6, ge=0)
     faketime_near_event_threshold: float = Field(default=0.0, ge=0)
+    quiescent_accumulation_window: float = Field(default=0.0, ge=0)
     otel_enabled: bool = False
     otel_endpoint: str = "http://127.0.0.1:4318/v1/traces"
     otel_service_name: str = "flux-fiction"
@@ -328,8 +356,10 @@ def from_toml(args: dict) -> ExperimentConfig:
         "faketime_seed",
         "faketime_tolerance",
         "faketime_near_event_threshold",
+        "quiescent_accumulation_window",
         "account_system_latency",
         "jobtap_logging",
+        "submit_novalidate",
         "otel_enabled",
         "otel_endpoint",
         "otel_service_name",

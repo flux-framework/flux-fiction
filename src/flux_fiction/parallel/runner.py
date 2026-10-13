@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +15,10 @@ import time
 from typing import Any, Callable
 
 from flux_fiction.api.status import RunStatusWriter, utcnow_iso
+from flux_fiction.parallel import flux_launch
 from flux_fiction.parallel.config import ParallelRunPlan, ResolvedParallelPlan
+
+logger = logging.getLogger(__name__)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -48,8 +52,13 @@ def _write_flux_fiction_toml(path: Path, data: dict[str, Any]) -> None:
 
 
 def _read_json_dict(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
+    # No exists() pre-check. Path.exists() only swallows a fixed set of errnos,
+    # so a transient filesystem error (Lustre under load returning EIO/ESTALE)
+    # escaped os.stat, unwound out of the parent's status-refresh loop, and
+    # killed the whole batch. Measured 2026-07-26: 117 of dane's 374 batches
+    # died this way after 3-4 hours of healthy running, each taking 16 live
+    # child runs with it. Opening directly is simpler and safe -- a missing file
+    # raises FileNotFoundError, which this except already handles.
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -105,7 +114,7 @@ def _normalize_config_snapshot_paths(source_config: Path, cfg: dict[str, Any]) -
     return normalized
 
 
-def _build_run_command(prepared: PreparedParallelRun) -> list[str]:
+def _build_run_command(prepared: PreparedParallelRun, max_concurrent: int = 1) -> list[str]:
     cmd = [
         sys.executable,
         "-m",
@@ -122,10 +131,25 @@ def _build_run_command(prepared: PreparedParallelRun) -> list[str]:
         cmd.extend(["--tag", prepared.plan.tag])
     if prepared.plan.no_faketime:
         cmd.append("--no-faketime")
-    return cmd
+    if os.environ.get("FLUX_FICTION_NO_BROKER_LOG_FILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        cmd.append("--no-broker-log-file")
+    # OpenTelemetry profiling per replica (run_ff starts a non-faketime bridge
+    # and writes otel_spans.jsonl into the child run dir). Off unless set.
+    if os.environ.get("FLUX_FICTION_OTEL", "").lower() in {"1", "true", "yes", "on"}:
+        cmd.append("--otel")
+    # Flux-native placement: the enclosing instance allocates a disjoint core
+    # block per replica and the job shell binds to it. Empty prefix (plain
+    # launch) unless FLUX_FICTION_FLUX_LAUNCH is set.
+    flux_prefix = flux_launch.launch_prefix(prepared.plan.name, max_concurrent)
+    return flux_prefix + cmd
 
 
-def prepare_parallel_run(plan_run: ParallelRunPlan) -> PreparedParallelRun:
+def prepare_parallel_run(plan_run: ParallelRunPlan, max_concurrent: int = 1) -> PreparedParallelRun:
     run_root = Path(plan_run.run_root)
     child_run_dir = Path(plan_run.child_run_dir)
     stampfile = Path(plan_run.stampfile)
@@ -166,7 +190,7 @@ def prepare_parallel_run(plan_run: ParallelRunPlan) -> PreparedParallelRun:
         launch_metadata_file=launch_metadata_file,
         command=[],
     )
-    command = _build_run_command(prepared)
+    command = _build_run_command(prepared, max_concurrent)
     prepared = PreparedParallelRun(
         plan=prepared.plan,
         run_root=prepared.run_root,
@@ -361,23 +385,42 @@ def _print_final_run_summary(records: list[dict[str, Any]], *, show_makespan_ext
             )
 
 
+def _signal_process_group(proc: subprocess.Popen[str], sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            return
+
+
 def _terminate_active_process(proc: subprocess.Popen[str], *, timeout: float = 5.0) -> None:
     if proc.poll() is not None:
         return
-    try:
-        proc.terminate()
-    except ProcessLookupError:
-        return
+    _signal_process_group(proc, signal.SIGTERM)
     try:
         proc.wait(timeout=timeout)
         return
     except subprocess.TimeoutExpired:
         pass
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        return
+    _signal_process_group(proc, signal.SIGKILL)
     proc.wait(timeout=timeout)
+
+
+def _reap_lingering_flux_processes() -> None:
+    for pattern in ("flux-broker", "flux-shell", "flux-imp"):
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except Exception:
+            pass
 
 
 def run_parallel_plan(
@@ -392,7 +435,10 @@ def run_parallel_plan(
     manifest_snapshot_path = output_root / "manifest.snapshot.toml"
     shutil.copy2(plan.manifest_path, manifest_snapshot_path)
 
-    prepared_runs = [prepare_parallel_run(run_plan) for run_plan in plan.runs]
+    prepared_runs = [
+        prepare_parallel_run(run_plan, max_concurrent=plan.max_concurrent)
+        for run_plan in plan.runs
+    ]
     for prepared in prepared_runs:
         if command_builder is not None:
             command = command_builder(prepared)
@@ -463,20 +509,28 @@ def run_parallel_plan(
     shutdown_signal: dict[str, int | None] = {"signal": None}
 
     def refresh_parent_status(final_state: str | None = None) -> None:
-        for idx, record in enumerate(run_records):
-            child_status = _read_json_dict(Path(record["status_file"]))
-            child_summary = _read_json_dict(Path(record["summary_file"]))
-            updated = _snapshot_run_status(record, child_status)
-            refreshed = _snapshot_run_summary(updated, child_summary)
-            run_records[idx].clear()
-            run_records[idx].update(refreshed)
-        counts = _summarize_records(run_records)
-        status.update(
-            state=final_state or "running",
-            total_runs=len(run_records),
-            runs=run_records,
-            **counts,
-        )
+        # Purely observational bookkeeping, polled on every loop. It must never
+        # be able to abort the batch: the child runs are the actual work, they
+        # write their own status/summary files, and results.csv is rebuilt from
+        # those. Losing one refresh costs nothing -- the next poll picks it up
+        # -- whereas raising here discards hours of work across every replica.
+        try:
+            for idx, record in enumerate(run_records):
+                child_status = _read_json_dict(Path(record["status_file"]))
+                child_summary = _read_json_dict(Path(record["summary_file"]))
+                updated = _snapshot_run_status(record, child_status)
+                refreshed = _snapshot_run_summary(updated, child_summary)
+                run_records[idx].clear()
+                run_records[idx].update(refreshed)
+            counts = _summarize_records(run_records)
+            status.update(
+                state=final_state or "running",
+                total_runs=len(run_records),
+                runs=run_records,
+                **counts,
+            )
+        except Exception:
+            logger.warning("parent status refresh failed; continuing", exc_info=True)
 
     def request_stop_for_pending(reason: str) -> None:
         while pending:
@@ -542,6 +596,7 @@ def run_parallel_plan(
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        start_new_session=True,
                     )
                 except Exception as e:
                     if log_handle is not None:
@@ -579,11 +634,21 @@ def run_parallel_plan(
                     record = record_by_name[active_run.prepared.plan.name]
                     if child_status.get("state") == "running":
                         record["state"] = "running"
+                        # First moment the child reports "running" is when the
+                        # trace is loaded and the sim loop starts. Stamped from
+                        # the runner's clock because the child is preloaded with
+                        # libfaketime and its own timestamps are simulated.
+                        if not record.get("sim_started_at"):
+                            record["sim_started_at"] = utcnow_iso()
+                            record["startup_seconds"] = _elapsed_seconds(
+                                record.get("started_at"), record["sim_started_at"]
+                            )
                     continue
 
                 completed_any = True
                 active.remove(active_run)
                 active_run.log_handle.close()
+                _signal_process_group(active_run.proc, signal.SIGKILL)
                 record = record_by_name[active_run.prepared.plan.name]
                 child_status = _read_json_dict(active_run.prepared.child_status_file)
                 stop_request = stop_requests.get(active_run.prepared.plan.name)
@@ -594,6 +659,13 @@ def run_parallel_plan(
                 record["state"] = final_state
                 record["finished_at"] = utcnow_iso()
                 record["return_code"] = rc
+                record["wall_seconds"] = _elapsed_seconds(
+                    record.get("started_at"), record["finished_at"]
+                )
+                if record.get("sim_started_at"):
+                    record["sim_wall_seconds"] = _elapsed_seconds(
+                        record["sim_started_at"], record["finished_at"]
+                    )
                 if stop_request is not None and not child_status.get("failure_reason"):
                     record["failure_reason"] = stop_request["reason"]
                 elif child_status.get("failure_reason"):
@@ -640,6 +712,7 @@ def run_parallel_plan(
             if active_run.proc.poll() is None:
                 _terminate_active_process(active_run.proc)
             active_run.log_handle.close()
+        _reap_lingering_flux_processes()
 
     final_state = "interrupted" if interrupted_reason is not None else ("failed" if failure_seen else "succeeded")
     refresh_parent_status(final_state=final_state)

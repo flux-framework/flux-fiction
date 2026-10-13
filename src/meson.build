@@ -104,7 +104,13 @@ shared_module(
   include_directories: [
     include_directories('jobtap'),
   ],
-  c_args: ['-Wall', '-Wextra', '-I' + flux_include_dir],
+  c_args: [
+    '-Wall',
+    '-Wextra',
+    '-Werror=implicit-function-declaration',
+    '-I' + flux_include_dir,
+    '-D_GNU_SOURCE',
+  ],
   name_prefix: '',
   install: true,
   install_dir: join_paths(py_install_dir, 'flux_fiction', '_native'),

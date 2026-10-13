@@ -26,7 +26,24 @@ import json
 import os
 from tqdm import tqdm
 
+# dftracer imports for simulated-time job lifecycle tracing
+try:
+    from dftracer.python import dftracer, dft_fn as DFTracerFn
+    _dft = DFTracerFn("simulation")
+    _dft_available = True
+except ImportError:
+    _dft = None
+    _dft_available = False
+
 logger = logging.getLogger(__name__)
+
+# How often (in time-steps) to stat the early-finalize sentinel. Cheap next to
+# the status.json write that already happens every step, but throttled anyway.
+EARLY_FINALIZE_CHECK_EVERY = 10
+FLUXION_MODULE_STATS = (
+    "sched-fluxion-qmanager",
+    "sched-fluxion-resource",
+)
 
 # tracer = get_tracer()
 
@@ -45,6 +62,47 @@ def _write_summary_file(path: str | None, payload: dict) -> None:
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
+
+
+def _collect_flux_module_stats(adapter: Adapter) -> dict[str, dict]:
+    getter = getattr(adapter, "get_flux_module_stats", None)
+    if getter is None:
+        return {}
+
+    collected = {}
+    for module_name in FLUXION_MODULE_STATS:
+        try:
+            collected[module_name] = {"stats": getter(module_name)}
+        except Exception as e:
+            collected[module_name] = {"error": repr(e)}
+    return collected
+
+
+def _print_flux_module_stats(module_stats: dict[str, dict]) -> None:
+    for module_name in FLUXION_MODULE_STATS:
+        result = module_stats.get(module_name)
+        if not result:
+            continue
+
+        print(f"Flux module stats ({module_name}):")
+        if "error" in result:
+            print(f"  ERROR: {result['error']}")
+        else:
+            print(
+                json.dumps(
+                    result.get("stats", {}),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+
+
+def _collect_scheduler_metrics(adapter: Adapter) -> dict:
+    getter = getattr(adapter, "get_scheduler_metrics", None)
+    if getter is None:
+        return {}
+    return getter()
 
 
 def run(
@@ -79,7 +137,7 @@ def run(
     resource_cores_per_node = int(resource_desc.get("cores_per_node") or config.ncpus)
     resource_gpus_per_node = int(resource_desc.get("gpus_per_node") or config.ngpus or 0)
 
-    #TODO understand how jobspec_shape is generated
+
     jobspec_shape = resource_desc.get("jobspec_shape", {})
     rabbit_storage = resource_desc.get("rabbit_storage", {})
     raw_jobspec_override = None
@@ -110,8 +168,11 @@ def run(
         batch_job_starts=config.batch_job_starts,
         account_system_latency=config.account_system_latency,
         jobtap_logging=config.jobtap_logging,
+        async_submit=getattr(config, "async_submit", False),
+        submit_novalidate=getattr(config, "submit_novalidate", False),
         output_dir = config.output_dir,
         faketime_controller=faketime_controller,
+        quiescent_accumulation_window=config.quiescent_accumulation_window,
         otel_enabled=config.otel_enabled,
         otel_bridge_socket=config.otel_bridge_socket,
         otel_service_name=config.otel_service_name,
@@ -121,20 +182,27 @@ def run(
         trace_file=config.job_traces,
     )
 
-    adapter.open(simulation)
+    run_span_id = simulation.telemetry.start_span(
+        "engine.run_total",
+        output_dir=config.output_dir,
+        trace_file=getattr(config, "job_traces", None),
+    )
 
-    adapter.install_resources(config)
-    adapter.reload_scheduler(config)
-    adapter.register_exec_service()
-    adapter.arm_watchers()
-    adapter.register_job_tracking()
+    with simulation.telemetry.span("engine.adapter_setup"):
+        adapter.open(simulation)
+        adapter.install_resources(config)
+        adapter.reload_scheduler(config)
+        adapter.register_exec_service()
+        adapter.arm_watchers()
+        adapter.register_job_tracking()
 
     # adapter.configure_backend(config, simulation.start_job)
 
     reader = models.SacctReader(config.job_traces, require_gpus=(config.ngpus and config.ngpus > 0))
-    
-    reader.validate_trace()
-    jobs = list(reader.read_trace())
+
+    with simulation.telemetry.span("engine.trace_load"):
+        reader.validate_trace()
+        jobs = list(reader.read_trace())
     simulation.jobs_total = len(jobs)
     simulation.write_status_snapshot(state="running")
 
@@ -143,42 +211,47 @@ def run(
     for idx, job in enumerate(jobs):
         job.trace_index = idx  
  
-    for job in jobs:
-        if raw_jobspec_override is not None:
-            job.set_jobspec_override(raw_jobspec_override)
-        else:
-            job.set_jobspec_shape(jobspec_shape)
-            job.set_rabbit_storage_shape(
-                rabbit_storage,
-                emit_dw=config.rabbit_storage_emit_dw,
-                name=config.rabbit_storage_name,
-            )
-            if config.exclusive:
-                job.set_exclusive(resource_cores_per_node, resource_gpus_per_node)
-    for job in jobs:
-        job.insert_apriori_events(simulation)
+    with simulation.telemetry.span("engine.prepare_jobs", jobs_total=len(jobs)):
+        for job in jobs:
+            if raw_jobspec_override is not None:
+                job.set_jobspec_override(raw_jobspec_override)
+            else:
+                job.set_jobspec_shape(jobspec_shape)
+                job.set_rabbit_storage_shape(
+                    rabbit_storage,
+                    emit_dw=config.rabbit_storage_emit_dw,
+                    name=config.rabbit_storage_name,
+                )
+                if config.exclusive:
+                    job.set_exclusive(resource_cores_per_node, resource_gpus_per_node)
+        for job in jobs:
+            job.insert_apriori_events(simulation)
     pbar = tqdm(total=len(jobs), desc="Jobs completed", unit="job", leave=True)
     simulation.progress = pbar
 
     # with tracer.start_as_current_span("simulation.advance"):
     try:
-        simulation.advance()
+        with simulation.telemetry.span("engine.prime_simulation"):
+            simulation.advance()
     except Exception as e:
         message = _finalize_failure(simulation) or str(e)
         logger.error("Simulation failed before reactor start: %s", message)
+        simulation.telemetry.end_span(run_span_id, state="failed", error=message)
         _close_progress(simulation)
         _close_adapter(adapter)
         simulation.telemetry.close()
         return EngineResult(ok=False, message=message)
 
     try:
-        adapter.start_reactor()
+        with simulation.telemetry.span("engine.reactor_run"):
+            adapter.start_reactor()
     except Exception as e:
         message = (
             _finalize_failure(simulation)
             or f"Error during simulation time: {e}"
         )
         logger.error("Reactor encountered an exception: %s", message)
+        simulation.telemetry.end_span(run_span_id, state="failed", error=message)
         _close_progress(simulation)
         _close_adapter(adapter)
         simulation.telemetry.close()
@@ -186,42 +259,47 @@ def run(
 
     if simulation.failed_reason:
         message = _finalize_failure(simulation)
+        simulation.telemetry.end_span(run_span_id, state="failed", error=message)
         _close_progress(simulation)
         _close_adapter(adapter)
         simulation.telemetry.close()
         return EngineResult(ok=False, message=message)
 
+    scheduler_metrics = _collect_scheduler_metrics(adapter)
+    flux_module_stats = _collect_flux_module_stats(adapter)
+
     try:
-        adapter.close()
+        with simulation.telemetry.span("engine.adapter_close"):
+            adapter.close()
     except Exception as e:
         logger.error(f"Error tearing down watchers {e}")
+        simulation.telemetry.end_span(run_span_id, state="failed", error="Error tearing down watchers")
         simulation.telemetry.close()
         return EngineResult(ok=False, message="Error tearing down watchers")
-    finally:
-        if simulation.telemetry is not None:
-            simulation.telemetry.close()
 
     if simulation.progress is not None:
         simulation.progress.close()
 
     #TODO add a way to verify that the eventlog is done before grabbing it :)
 
-    run_id = f"nodes{resource_nnodes}_cpr{resource_cores_per_node}"
-    kvs_outfile = f"{config.output_dir}kvs_growth_{run_id}.csv"
-    simulation.dump_kvs_timeseries(kvs_outfile)
-    logger.info(f"Wrote KVS time series to {kvs_outfile}")
+    with simulation.telemetry.span("engine.postprocess"):
+        run_id = f"nodes{resource_nnodes}_cpr{resource_cores_per_node}"
+        kvs_outfile = f"{config.output_dir}kvs_growth_{run_id}.csv"
+        simulation.dump_kvs_timeseries(kvs_outfile)
+        logger.info(f"Wrote KVS time series to {kvs_outfile}")
 
-    simulation.dump_eventlog()
-    filesystem_output.dump_transitions_to_csv(simulation, f"{config.output_dir}job_transitions.csv", adapter)
-    filesystem_output.write_per_node_chrome_trace(simulation, f"{config.output_dir}pernode.json", adapter)
-    resource_summary = output_vis.summarize_and_plot_resources(
-        simulation,
-        adapter,
-        resource_desc,
-        config.output_dir,
-        config_json=config.config_json,
-        config_exclusive=config.exclusive,
-    )
+        simulation.dump_eventlog()
+        filesystem_output.dump_transitions_to_csv(simulation, f"{config.output_dir}job_transitions.csv", adapter)
+        filesystem_output.write_per_node_chrome_trace(simulation, f"{config.output_dir}pernode.json", adapter)
+        resource_summary = output_vis.summarize_and_plot_resources(
+            simulation,
+            adapter,
+            resource_desc,
+            config.output_dir,
+            config_json=config.config_json,
+            config_exclusive=config.exclusive,
+            make_plots=getattr(config, "make_plots", True),
+        )
 
     kvs_size_end = int(adapter.get_kvs_stats().get("dbfile_size", 0))
     completed = max(1, simulation.num_complete)  
@@ -255,6 +333,24 @@ def run(
         max_wait = max(waits)
         print(f"Max queue wait time: {max_wait:.6f} seconds (sim time)")
 
+    _print_flux_module_stats(flux_module_stats)
+
+    observed_start_lags = sorted(
+        float(job.flux_observed_start) - float(job.state_transitions["STARTED"])
+        for job in simulation.job_map.values()
+        if job.flux_observed_start is not None
+        and job.state_transitions.get("STARTED") is not None
+    )
+    observed_start_lag_avg = (
+        sum(observed_start_lags) / len(observed_start_lags)
+        if observed_start_lags else None
+    )
+    observed_start_lag_max = observed_start_lags[-1] if observed_start_lags else None
+    observed_start_lag_p95 = (
+        observed_start_lags[min(len(observed_start_lags) - 1, int(0.95 * len(observed_start_lags)))]
+        if observed_start_lags else None
+    )
+
     summary_payload = {
         "version": 1,
         "state": "succeeded",
@@ -269,13 +365,24 @@ def run(
         "makespan_hours": float(makespan) / 3600.0,
         "avg_queue_wait_seconds": None if avg_wait is None else float(avg_wait),
         "max_queue_wait_seconds": None if max_wait is None else float(max_wait),
+        "quiescence_epochs": int(simulation.current_epoch),
+        "last_quiescent_epoch": int(simulation.last_quiescent_epoch),
+        "stale_quiescence_replies": int(simulation.stale_quiescence_replies),
+        "flux_observed_start_lag_samples": len(observed_start_lags),
+        "flux_observed_start_lag_avg_seconds": observed_start_lag_avg,
+        "flux_observed_start_lag_p95_seconds": observed_start_lag_p95,
+        "flux_observed_start_lag_max_seconds": observed_start_lag_max,
         "kvs_size_start_bytes": int(kvs_size_start),
         "kvs_size_end_bytes": int(kvs_size_end),
         "kvs_bytes_per_completed_job": float(kvs_bytes_per_completed),
         "kvs_growth_bytes_per_sim_s": float(kvs_growth_bytes_per_sim_s),
         "resource_summary": resource_summary,
+        "scheduler_metrics": scheduler_metrics,
+        "flux_module_stats": flux_module_stats,
     }
     _write_summary_file(getattr(config, "summary_file", None), summary_payload)
+    simulation.telemetry.end_span(run_span_id, state="succeeded", makespan_seconds=float(makespan))
+    simulation.telemetry.close()
 
     return EngineResult(ok=True, message="Ran Successfully")
 
@@ -320,8 +427,11 @@ class Simulation(object):
             batch_job_starts: bool = True,
             account_system_latency: bool = True,
             jobtap_logging: bool = False,
+            async_submit: bool = False,
+            submit_novalidate: bool = False,
             output_dir: str = "./",
             faketime_controller: FakeTimeController | None = None,
+            quiescent_accumulation_window: float = 0.0,
             otel_enabled: bool = False,
             otel_bridge_socket: str | None = None,
             otel_service_name: str = "flux-fiction",
@@ -343,6 +453,20 @@ class Simulation(object):
         self.start_job_hook = start_job_hook
         self.complete_job_hook = complete_job_hook
         self.pending_continuation = False
+        # Jobs whose submission is in flight but whose id has not been
+        # collected yet. Drained before any quiescence traffic, so the
+        # scheduler is never told about a job whose id we do not hold.
+        self._pending_submits = []
+        self.async_submit = bool(async_submit) and bool(
+            getattr(adapter, "supports_async_submit", lambda: False)()
+        )
+        self.submit_novalidate = bool(submit_novalidate)
+        if async_submit and not self.async_submit:
+            logger.warning(
+                "async_submit requested but %s does not support it; "
+                "falling back to blocking submits",
+                type(adapter).__name__,
+            )
         self.step_expect = defaultdict(lambda: {"submits": 0, "finishes": 0})
         self.time_step = 0
         self.pending_start_msgs = {} 
@@ -362,10 +486,26 @@ class Simulation(object):
         self.otel_enabled = bool(otel_enabled and otel_bridge_socket)
         self.otel_bridge_socket = otel_bridge_socket
         self.otel_service_name = otel_service_name
-        self.quiescent_accumulation_window = 1.0
+        # A positive window coalesces distinct logical event buckets before
+        # asking the scheduler for quiescence.  That is an optional throughput
+        # tradeoff: it changes the scheduler-visible ordering and therefore
+        # must not be the correctness default.
+        self.quiescent_accumulation_window = float(quiescent_accumulation_window)
         self.pending_quiescent_expect = {"submits": 0, "finishes": 0}
+        # Epochs make delayed quiescence replies harmless.  An epoch advances
+        # once for each synchronous bucket that mutates scheduler-visible state.
+        self.current_epoch = 0
+        self.latest_mutating_epoch = 0
+        self.last_quiescent_epoch = 0
+        self.quiescence_inflight = False
+        self.quiescence_epoch = None
+        self.quiescence_bucket_time = None
+        self.stale_quiescence_replies = 0
         self.num_started = 0
         self.jobs_total = 0
+        self.early_finalize_requested = False
+        self.early_finalize_reason = ""
+        self._finalize_check_counter = 0
         self.status_writer = status or RunStatusWriter(None)
         self.status_context = {
             "run_dir": str(Path(output_dir).resolve().parent) if output_dir else None,
@@ -407,6 +547,16 @@ class Simulation(object):
         self.pending_quiescent_expect["submits"] += int(expect.get("submits", 0) or 0)
         self.pending_quiescent_expect["finishes"] += int(expect.get("finishes", 0) or 0)
 
+    def _bump_epoch_for_expect(self, expect):
+        if not expect:
+            return False
+        mutates = int(expect.get("submits", 0) or 0) + int(expect.get("finishes", 0) or 0)
+        if mutates <= 0:
+            return False
+        self.current_epoch += 1
+        self.latest_mutating_epoch = self.current_epoch
+        return True
+
     def _flush_pending_quiescent_expect(self):
         expect = {
             "submits": int(self.pending_quiescent_expect["submits"]),
@@ -414,11 +564,55 @@ class Simulation(object):
         }
         if expect["submits"] or expect["finishes"]:
             self.adapter.accumulate_quiescent(json.dumps({
-                "time": self.current_time,
+                "epoch": self.current_epoch,
+                "logical_time": self.current_time,
                 "expect": expect,
             }))
         self.pending_quiescent_expect = {"submits": 0, "finishes": 0}
         return expect
+
+    def _send_quiescence_probe(self, *, final=False):
+        if self.quiescence_inflight:
+            return False
+        # Barrier: never probe, and never accumulate expectations, while a
+        # submission is still in flight. _flush_pending_quiescent_expect() is
+        # only reached from here, so this one call covers both.
+        with self.telemetry.span("simulation.drain_submits",
+                                 pending=len(self._pending_submits)):
+            self._drain_pending_submits()
+        expect = self._flush_pending_quiescent_expect()
+        probe_epoch = self.current_epoch
+        bucket_time = float(self.current_time)
+        payload = {
+            "epoch": probe_epoch,
+            "logical_time": bucket_time,
+            "expect": expect,
+            "final": bool(final),
+        }
+        span_id = self.telemetry.start_span(
+            "simulation.query_quiescent",
+            sim_time=bucket_time,
+            epoch=probe_epoch,
+            expect_submits=int(expect["submits"]),
+            expect_finishes=int(expect["finishes"]),
+            time_step=self.time_step,
+        )
+        self.quiescence_inflight = True
+        self.quiescence_epoch = probe_epoch
+        self.quiescence_bucket_time = bucket_time
+        try:
+            self.adapter.query_quiescent(
+                json.dumps(payload),
+                lambda fut, _arg, epoch=probe_epoch, logical_time=bucket_time, span=span_id:
+                    self.quiescent_cb(epoch, logical_time, span),
+            )
+        except Exception:
+            self.quiescence_inflight = False
+            self.quiescence_epoch = None
+            self.quiescence_bucket_time = None
+            self.telemetry.end_span(span_id, state="rpc_error")
+            raise
+        return True
 
     def _should_defer_quiescent(self, next_event_time):
         if next_event_time is None:
@@ -787,6 +981,22 @@ class Simulation(object):
     
     def submit_job(self, job):
         job.record_state_transition("SUBMITTED", models.qtime(self.current_time))
+        # Log job submission as simulated-time event
+        if _dft_available:
+            try:
+                sim_submit_time_ns = int(models.qtime(job.submit_time) * 1e9)
+                gap_ns = int(job.gap * 1e9) if hasattr(job, 'gap') else 0
+                trace_idx = getattr(job, "trace_index", None)
+                dftracer.get_instance().log_event(
+                    name="job_submit",
+                    cat="simulation",
+                    start_time=sim_submit_time_ns,
+                    duration=gap_ns,
+                    int_args={"trace_idx": (0, -1 if trace_idx is None else int(trace_idx))},
+                    string_args={"job_id": (0, str(getattr(job, "jobid", "") or ""))},
+                )
+            except Exception as e:
+                logger.debug("Failed to log job_submit event: %s", e)
         with self.telemetry.span(
             "simulation.submit_job",
             trace_idx=getattr(job, "trace_index", None),
@@ -797,7 +1007,13 @@ class Simulation(object):
                 if self.submit_job_hook:
                     self.submit_job_hook(self, job)
                 logger.debug("Submitting a new job")
-                job.submit(self.adapter)
+                if self.async_submit:
+                    # Start it and move on; the id is collected in
+                    # _drain_pending_submits() before any quiescence traffic.
+                    job.submit_async(self.adapter)
+                    self._pending_submits.append(job)
+                else:
+                    job.submit(self.adapter)
             except Exception as e:
                 job.record_state_transition("SUBMIT_FAILED", models.qtime(self.current_time))
                 self._fail(
@@ -812,8 +1028,40 @@ class Simulation(object):
 
         self.num_submits += 1
         self.final_quiescence_probe_sent = False
+        if self.async_submit:
+            # job.jobid is not known yet; job_map is populated at drain time.
+            return
         self.job_map[job.jobid] = job
         logger.info("Submitted job {}".format(job.jobid))
+
+    def _drain_pending_submits(self):
+        """Collect the job id of every in-flight submission.
+
+        This is the barrier that makes asynchronous submission safe: it runs
+        before the scheduler is told what to expect and before any quiescence
+        probe, so from the scheduler's point of view the set of jobs present at
+        a given logical time is identical to the blocking path.
+        """
+        if not self._pending_submits:
+            return 0
+        pending, self._pending_submits = self._pending_submits, []
+        for job in pending:
+            try:
+                job.resolve_submit(self.adapter)
+            except Exception as e:
+                job.record_state_transition("SUBMIT_FAILED", models.qtime(self.current_time))
+                self._fail(
+                    "Submit failed (async resolve) for trace_idx={}: {}\nJobspec:\n{}"
+                    .format(
+                        getattr(job, "trace_index", None),
+                        e,
+                        json.dumps(job.jobspec, indent=2, sort_keys=True, default=str),
+                    )
+                )
+                raise
+            self.job_map[job.jobid] = job
+            logger.info("Submitted job {}".format(job.jobid))
+        return len(pending)
 
     def start_job(self, jobid):
         job: models.Job = self.job_map[jobid]
@@ -830,8 +1078,14 @@ class Simulation(object):
                 self.start_job_hook(self, job)
 
             if self.account_system_latency and self.faketime_controller is not None:
+                # Faketime is an observation channel for Flux, not simulator
+                # truth.  Scheduler/emulator wall lag must not move STARTED or
+                # the completion event derived from it.
+                job.flux_observed_start = models.qtime(
+                    self.faketime_controller.current_effective_time()
+                )
                 job.ack_start(self.adapter)
-                start_time = models.qtime(self.faketime_controller.current_effective_time())
+                start_time = models.qtime(self.current_time)
                 job.mark_started(start_time)
             elif self.account_system_latency:
                 start_time = models.qtime(self.current_time)
@@ -841,6 +1095,44 @@ class Simulation(object):
                 start_time = models.qtime(self.current_time + job.gap)
                 job.mark_started(start_time)
                 job.ack_start(self.adapter)
+
+            # Log job start as simulated-time event (after all branches have set start_time)
+            if _dft_available:
+                try:
+                    sim_start_time_ns = int(models.qtime(job.start_time) * 1e9)
+                    gap_ns = int(job.gap * 1e9) if hasattr(job, 'gap') else 0
+                    # mhost: emit ONE event PER allocated node (not one event with
+                    # a comma-joined node list) so a trace viewer can actually
+                    # group/filter by individual simulated node — same pattern
+                    # as per-MPI-rank tracing. Same start_time/duration on every
+                    # per-node event; only mhost differs. Stored on the job so
+                    # complete_job() reuses the same node list without a second
+                    # RPC (pid/tid stay dummy/constant — this single Python
+                    # process emulates every node, so mhost is the only field
+                    # that actually distinguishes nodes in the trace).
+                    nodes = []
+                    _src = None
+                    try:
+                        nodes, _src = self.adapter.nodelist_lookup(jobid)
+                    except Exception as e:
+                        logger.warning("dftrace job_start nodelist_lookup failed jobid=%s: %r", jobid, e)
+                        nodes = []
+                    if not nodes:
+                        logger.debug("dftrace job_start empty nodelist jobid=%s src=%s", jobid, _src)
+                    job.allocated_nodes = nodes
+                    node_ids = [str(n) for n in sorted(nodes)] if nodes else [""]
+                    trace_idx = getattr(job, "trace_index", None)
+                    for node_id in node_ids:
+                        dftracer.get_instance().log_event(
+                            name="job_start",
+                            cat="simulation",
+                            start_time=sim_start_time_ns,
+                            duration=gap_ns,
+                            int_args={"trace_idx": (0, -1 if trace_idx is None else int(trace_idx))},
+                            string_args={"job_id": (0, str(jobid or "")), "mhost": (0, node_id)},
+                        )
+                except Exception as e:
+                    logger.debug("Failed to log job_start event: %s", e)
 
             job.record_state_transition("STARTED", start_time)
             job.queue_wait = job.queue_wait_time()
@@ -857,6 +1149,25 @@ class Simulation(object):
         self.num_complete += 1
         self.final_quiescence_probe_sent = False
         t = models.qtime(self.current_time)
+        # Log job completion as simulated-time event (spans from start to finish)
+        if _dft_available:
+            try:
+                sim_start_time_ns = int(models.qtime(job.start_time) * 1e9)
+                duration_ns = int(models.qtime(job.elapsed_time) * 1e9)
+                nodes = getattr(job, "allocated_nodes", None) or []
+                node_ids = [str(n) for n in sorted(nodes)] if nodes else [""]
+                trace_idx = getattr(job, "trace_index", None)
+                for node_id in node_ids:
+                    dftracer.get_instance().log_event(
+                        name="job_complete",
+                        cat="simulation",
+                        start_time=sim_start_time_ns,
+                        duration=duration_ns,
+                        int_args={"trace_idx": (0, -1 if trace_idx is None else int(trace_idx))},
+                        string_args={"job_id": (0, str(getattr(job, "jobid", "") or "")), "mhost": (0, node_id)},
+                    )
+            except Exception as e:
+                logger.debug("Failed to log job_complete event: %s", e)
         job.record_state_transition("COMPLETED", t)
         job.record_state_transition("INACTIVE", t)
         job.real_finish = time.time() 
@@ -879,10 +1190,58 @@ class Simulation(object):
                 jobid, state)
 
     
+    def finalize_sentinel_path(self):
+        """Sentinel the (unfaked) parent process touches when time is short."""
+        if not self.output_dir:
+            return None
+        return Path(self.output_dir) / ".finalize_now"
+
+    def _early_finalize_requested(self):
+        """Has the parent asked us to wrap up before the allocation expires?
+
+        The check is a file stat rather than a clock read because this process
+        runs under libfaketime -- its own clocks report simulated time and
+        cannot see the real wall approaching. The parent watcher is not
+        preloaded, so it owns the real deadline and signals through the
+        filesystem.
+        """
+        if self.early_finalize_requested:
+            return True
+        self._finalize_check_counter += 1
+        if self._finalize_check_counter % EARLY_FINALIZE_CHECK_EVERY:
+            return False
+        sentinel = self.finalize_sentinel_path()
+        if sentinel is not None and sentinel.exists():
+            try:
+                reason = sentinel.read_text(encoding="utf-8").strip()
+            except OSError:
+                reason = ""
+            self.early_finalize_requested = True
+            self.early_finalize_reason = reason or "walltime budget nearly exhausted"
+            return True
+        return False
+
     def advance(self, *args, **kwargs):
         if self.failed_reason:
             return
         while not self.failed_reason:
+            # Wrap up early rather than being SIGKILLed at the wall with an
+            # empty output directory: run the same post-sim analysis the normal
+            # path runs, so a truncated run still yields complete artifacts for
+            # however many jobs it got through.
+            if self._early_finalize_requested():
+                logger.warning(
+                    "Early finalize requested (%s); stopping at time_step=%d with "
+                    "%d/%d jobs complete and writing partial results",
+                    self.early_finalize_reason,
+                    self.time_step,
+                    self.num_complete,
+                    self.jobs_total,
+                )
+                self.write_status_snapshot(state="running")
+                self.post_verification()
+                self.adapter.stop_reactor()
+                return
             events_at_time = []
 
             try:
@@ -897,23 +1256,9 @@ class Simulation(object):
 
                     logger.info("Event list empty but jobs in flight; probing jobtap for quiescence")
                     self.final_quiescence_probe_sent = True
-                    quiescent_span = None
                     try:
-                        expect = self._flush_pending_quiescent_expect()
-                        quiescent_span = self.telemetry.start_span(
-                            "simulation.query_quiescent",
-                            sim_time=self.current_time,
-                            expect_submits=int(expect["submits"]),
-                            expect_finishes=int(expect["finishes"]),
-                            time_step=self.time_step,
-                        )
-                        self.adapter.query_quiescent(
-                            json.dumps({"time": self.current_time}),
-                            lambda fut, _arg, span_id=quiescent_span: self.quiescent_cb(span_id)
-                        )
+                        self._send_quiescence_probe(final=True)
                     except Exception as e:
-                        if quiescent_span is not None:
-                            self.telemetry.end_span(quiescent_span, error=repr(e))
                         self._fail(
                             "Final quiescence query failed at sim_time={}: {}"
                             .format(self.current_time, e)
@@ -974,9 +1319,11 @@ class Simulation(object):
             if self.time_step == 0:
                 print("")
             self.time_step += 1
-            self.write_status_snapshot(state="running")
+            with self.telemetry.span("simulation.status_snapshot"):
+                self.write_status_snapshot(state="running")
 
             expect = self.step_expect.get(self.current_time, {"submits": 0, "finishes": 0})
+            self._bump_epoch_for_expect(expect)
             self._add_pending_quiescent_expect(expect)
             if self.current_time in self.step_expect:
                 del self.step_expect[self.current_time]
@@ -992,23 +1339,9 @@ class Simulation(object):
                 continue
 
             logger.debug("Querying Quiescent")
-            quiescent_span = None
             try:
-                flushed_expect = self._flush_pending_quiescent_expect()
-                quiescent_span = self.telemetry.start_span(
-                    "simulation.query_quiescent",
-                    sim_time=self.current_time,
-                    expect_submits=int(flushed_expect["submits"]),
-                    expect_finishes=int(flushed_expect["finishes"]),
-                    time_step=self.time_step,
-                )
-                self.adapter.query_quiescent(
-                    json.dumps({"time": self.current_time}),
-                    lambda fut, _arg, span_id=quiescent_span: self.quiescent_cb(span_id),
-                )
+                self._send_quiescence_probe()
             except Exception as e:
-                if quiescent_span is not None:
-                    self.telemetry.end_span(quiescent_span, error=repr(e))
                 self._fail(
                     "Quiescent query failed at sim_time={}: {}"
                     .format(self.current_time, e)
@@ -1022,13 +1355,36 @@ class Simulation(object):
     #     '''
     #     return self.job_manager_quiescent and len(self.pending_inactivations) == 0
 
-    def quiescent_cb(self, span_id=None):
+    def quiescent_cb(self, reply_epoch, bucket_time, span_id=None):
         '''
         Calls upon the scheduler to see if it is idle
         '''
         logger.debug("Hit quiescent")
         logger.info("Quiescent confirmed by jobtap")
-        self.telemetry.end_span(span_id, sim_time=self.current_time)
+        self.quiescence_inflight = False
+        self.quiescence_epoch = None
+        self.quiescence_bucket_time = None
+        stale = reply_epoch != self.current_epoch or bucket_time != float(self.current_time)
+        self.telemetry.end_span(
+            span_id,
+            sim_time=self.current_time,
+            reply_epoch=reply_epoch,
+            current_epoch=self.current_epoch,
+            stale=stale,
+        )
+        if stale:
+            self.stale_quiescence_replies += 1
+            logger.info(
+                "Ignoring stale quiescence reply epoch=%s bucket=%s; current epoch=%s bucket=%s",
+                reply_epoch,
+                bucket_time,
+                self.current_epoch,
+                self.current_time,
+            )
+            if not self.failed_reason:
+                self._send_quiescence_probe()
+            return
+        self.last_quiescent_epoch = reply_epoch
         self.job_manager_quiescent = True
         if self.failed_reason:
             return

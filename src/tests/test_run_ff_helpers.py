@@ -45,7 +45,9 @@ def test_write_flux_fiction_toml_and_load_toml(tmp_path: Path):
 def test_drop_faketime_env_and_broker_log_matches(tmp_path: Path):
     env = {
         "LD_PRELOAD": "x",
+        "FAKETIME": "@2026-04-01 00:00:00",
         "FAKETIME_ONE": "1",
+        "STAMPFILE": "/tmp/stamp",
         "KEEP": "ok",
     }
     cleaned = run_ff.drop_faketime_env(env)
@@ -56,6 +58,25 @@ def test_drop_faketime_env_and_broker_log_matches(tmp_path: Path):
     matches = run_ff.broker_log_matches(log_path, "sched-fluxion-resource.err")
     assert matches == ["2: sched-fluxion-resource.err bad"]
     assert run_ff.broker_log_matches(tmp_path / "missing.log", "x") == []
+
+
+def test_build_faketime_environment_selects_shared_or_legacy(tmp_path: Path):
+    library = tmp_path / "libfaketimeMT.so.1"
+    stamp = tmp_path / "stamp"
+
+    shared = run_ff.build_faketime_environment(library, stamp, 100.25, "shared")
+    assert shared["FAKETIME_SHARED_CLOCK"] == "1"
+    assert shared["FAKETIME_SHARED_CLOCK_INITIAL_NS"] == "100250000000"
+    assert "FAKETIME_TIMESTAMP_FILE" not in shared
+    assert "FAKETIME_NO_CACHE" not in shared
+
+    legacy = run_ff.build_faketime_environment(library, stamp, 100.25, "legacy")
+    assert legacy["FAKETIME_TIMESTAMP_FILE"] == str(stamp)
+    assert legacy["FAKETIME_NO_CACHE"] == "1"
+    assert "FAKETIME_SHARED_CLOCK" not in legacy
+
+    with pytest.raises(ValueError, match="unsupported faketime mode"):
+        run_ff.build_faketime_environment(library, stamp, 100.25, "bad")
 
 
 def test_first_submit_epoch_uses_t_submit_and_submit(tmp_path: Path):
@@ -122,12 +143,17 @@ def test_prepare_config_copies_json_and_rewrites_paths(tmp_path: Path, monkeypat
         },
     )
 
-    generated, trace_path, output_dir = run_ff.prepare_config(source_config, tmp_path / "run")
+    generated, trace_path, output_dir = run_ff.prepare_config(
+        source_config,
+        tmp_path / "run",
+        config_overrides={"submit_novalidate": True},
+    )
     payload = run_ff.load_toml(generated)["flux_fiction"]
 
     assert trace_path == trace
     assert Path(payload["config_json"]).exists()
     assert payload["output_dir"].endswith("/output/")
+    assert payload["submit_novalidate"] is True
     assert Path(output_dir).is_dir()
 
 

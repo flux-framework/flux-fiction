@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import nullcontext
 from datetime import datetime
 import importlib.util
 import json
@@ -19,6 +20,8 @@ import hashlib
 from typing import Any
 
 from flux_fiction.api.status import RunStatusWriter, utcnow_iso
+from flux_fiction.faketime_paths import default_stampfile_path
+from flux_fiction.telemetry import TelemetryClient
 
 
 def repo_root() -> Path:
@@ -120,7 +123,7 @@ def write_flux_fiction_toml(path: Path, data: dict[str, Any]) -> None:
 def drop_faketime_env(env: dict[str, str]) -> dict[str, str]:
     cleaned = dict(env)
     for key in list(cleaned):
-        if key == "LD_PRELOAD" or key.startswith("FAKETIME_"):
+        if key in {"LD_PRELOAD", "FAKETIME", "STAMPFILE"} or key.startswith("FAKETIME_"):
             cleaned.pop(key, None)
     return cleaned
 
@@ -138,6 +141,9 @@ def broker_log_matches(log_path: Path, needle: str) -> list[str]:
 
 
 SCHED_RESOURCE_ERROR_NEEDLE = "sched-fluxion-resource.err"
+# Real seconds held back from the walltime budget so the simulation can run
+# post-sim analysis and write its outputs before the allocation is killed.
+DEFAULT_FINALIZE_RESERVE_SECONDS = 120.0
 
 
 def _terminate_process_group(proc: subprocess.Popen[str], sig: int) -> None:
@@ -147,6 +153,65 @@ def _terminate_process_group(proc: subprocess.Popen[str], sig: int) -> None:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
         return
+
+
+def _walltime_budget_seconds(explicit: float | None = None) -> float | None:
+    """Seconds of real time this run may use before it must wrap up."""
+    if explicit and explicit > 0:
+        return float(explicit)
+    raw = os.environ.get("FLUX_FICTION_WALLTIME_BUDGET_SECONDS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _watch_walltime_budget(
+    proc: subprocess.Popen[str],
+    output_dir: Path,
+    budget_seconds: float,
+    reserve_seconds: float,
+) -> None:
+    """Ask the simulation to finalize before the allocation expires.
+
+    This runs in the parent, which is deliberately NOT libfaketime-preloaded --
+    only the child Flux instance is. The simulation therefore cannot see real
+    time at all, so the real deadline has to be owned out here and signalled
+    through a sentinel file the engine stats.
+
+    ``reserve_seconds`` is the time left for post-sim analysis (dumping the
+    event log, transitions, allocations and summary). Too small and the wall
+    arrives mid-write; the outputs are the whole point of finishing early.
+    """
+    trigger_at = time.time() + max(0.0, budget_seconds - reserve_seconds)
+    sentinel = output_dir / ".finalize_now"
+    while proc.poll() is None:
+        remaining = trigger_at - time.time()
+        if remaining <= 0:
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                sentinel.write_text(
+                    "walltime budget exhausted: {:.0f}s budget, {:.0f}s reserved "
+                    "for finalization\n".format(budget_seconds, reserve_seconds),
+                    encoding="utf-8",
+                )
+                print(
+                    f"Walltime budget nearly exhausted; asked the simulation to "
+                    f"finalize early via {sentinel}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except OSError as exc:
+                print(
+                    f"Failed to write early-finalize sentinel {sentinel}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
+        time.sleep(min(5.0, max(0.5, remaining)))
 
 
 def _watch_broker_log_for_fatal_error(
@@ -282,7 +347,7 @@ def resolve_stampfile_path(
     if env_stamp:
         return remap_path(env_stamp, for_output=True), "environment"
 
-    return run_root / "faketime_stamp", "default"
+    return default_stampfile_path(run_root), "default"
 
 
 def warn_on_implicit_stampfile(path: Path, source: str) -> None:
@@ -294,7 +359,7 @@ def warn_on_implicit_stampfile(path: Path, source: str) -> None:
         )
     elif source == "default":
         print(
-            "WARNING: using default faketime stamp file inside the run directory: "
+            "WARNING: using default container-local faketime stamp file: "
             f"{path}",
             file=sys.stderr,
         )
@@ -318,6 +383,40 @@ def default_faketime_lib() -> str:
     return candidates[0]
 
 
+def build_faketime_environment(
+    faketime_lib: Path,
+    stamp_path: Path,
+    initial_fake_time: float,
+    mode: str,
+) -> dict[str, str]:
+    """Build the environment inherited by Flux and its complete process tree."""
+    env = {
+        "FLUX_LOAD_WITH_DEEPBIND": "0",
+        "LD_PRELOAD": str(faketime_lib),
+        # Flux's broker/reactor uses monotonic timers for internal progress.
+        "FAKETIME_DONT_FAKE_MONOTONIC": "1",
+    }
+    if mode == "shared":
+        env.update(
+            {
+                "FAKETIME_SHARED_CLOCK": "1",
+                "FAKETIME_SHARED_CLOCK_INITIAL_NS": str(
+                    int(round(initial_fake_time * 1_000_000_000))
+                ),
+            }
+        )
+    elif mode == "legacy":
+        env.update(
+            {
+                "FAKETIME_TIMESTAMP_FILE": str(stamp_path),
+                "FAKETIME_NO_CACHE": "1",
+            }
+        )
+    else:
+        raise ValueError(f"unsupported faketime mode: {mode}")
+    return env
+
+
 def configure_flux_env(env: dict[str, str]) -> None:
     prefix = Path(env.get("FLUX_PREFIX", str(default_flux_prefix())))
     if not prefix.exists():
@@ -335,10 +434,35 @@ def configure_flux_env(env: dict[str, str]) -> None:
     )
 
 
+def configure_dftracer_env(env: dict[str, str], run_root: Path) -> dict[str, str]:
+    if env.get("DFTRACER_ENABLE") != "1":
+        return {}
+
+    configured_prefix = env.get("DFTRACER_LOG_FILE")
+    if configured_prefix:
+        base_prefix = Path(configured_prefix).expanduser()
+        trace_prefix = base_prefix.parent / run_root.name / base_prefix.name
+    else:
+        trace_prefix = run_root / "dftracer" / "flux-fiction"
+
+    trace_prefix.parent.mkdir(parents=True, exist_ok=True)
+    dftracer_env = {
+        "DFTRACER_ENABLE": "1",
+        "DFTRACER_LOG_FILE": str(trace_prefix),
+    }
+    for name in ("DFTRACER_DATA_DIR", "DFTRACER_TIME_METRIC", "DFTRACER_INC_METADATA"):
+        if name in env:
+            dftracer_env[name] = env[name]
+
+    env.update(dftracer_env)
+    return dftracer_env
+
+
 def prepare_config(
     source_config: Path,
     run_root: Path,
     *,
+    config_overrides: dict[str, object] | None = None,
     otel: dict[str, str | bool] | None = None,
 ) -> tuple[Path, Path, Path]:
     cfg_doc = load_toml(source_config)
@@ -369,6 +493,8 @@ def prepare_config(
     cfg["status_file"] = str(run_root / "status.json")
     cfg["summary_file"] = str(run_root / "summary.json")
     cfg["source_config_file"] = str(source_config)
+    if config_overrides:
+        cfg.update(config_overrides)
     if otel:
         cfg.update(otel)
 
@@ -577,8 +703,38 @@ def main() -> int:
         "--stampfile",
         default=None,
         help=(
-            "Path to the libfaketime timestamp file. Default: a unique "
-            "faketime_stamp file inside the run directory."
+            "Legacy-mode libfaketime timestamp file. Default: a unique "
+            "container-local temp path derived from the run directory; unused "
+            "as a clock source in shared mode."
+        ),
+    )
+    parser.add_argument(
+        "--faketime-mode",
+        choices=("legacy", "shared"),
+        default=os.environ.get("FLUX_FICTION_FAKETIME_MODE", "legacy"),
+        help=(
+            "Clock update mechanism: legacy rereads --stampfile; shared uses "
+            "the optimized libfaketime API (default: legacy)."
+        ),
+    )
+    parser.add_argument(
+        "--walltime-budget-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Real seconds this run may use. When nearly exhausted the simulation "
+            "finalizes early and writes partial results instead of being killed "
+            "with an empty output directory. Also settable via "
+            "FLUX_FICTION_WALLTIME_BUDGET_SECONDS."
+        ),
+    )
+    parser.add_argument(
+        "--finalize-reserve-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Seconds held back from the walltime budget for post-sim analysis "
+            f"(default {DEFAULT_FINALIZE_RESERVE_SECONDS:.0f})."
         ),
     )
     parser.add_argument(
@@ -592,12 +748,30 @@ def main() -> int:
         help="Prepare the run directory and print the command without launching Flux.",
     )
     parser.add_argument(
+        "--submit-novalidate",
+        action="store_true",
+        default=None,
+        help=(
+            "Submit generated jobspecs with Flux's novalidate flag, skipping "
+            "job-ingest feasibility validation."
+        ),
+    )
+    parser.add_argument(
         "--broker-log-level",
         type=int,
         default=6,
         help=(
             "Flux broker log-level attribute. Default 6 keeps info and above; "
             "use 7 for debug."
+        ),
+    )
+    parser.add_argument(
+        "--no-broker-log-file",
+        action="store_true",
+        help=(
+            "Do not configure Flux's log-filename sink. Broker errors remain "
+            "visible in the captured run log, while high-volume broker debug "
+            "traffic is kept off the filesystem."
         ),
     )
     parser.add_argument(
@@ -661,9 +835,13 @@ def main() -> int:
             "otel_spans_file": str(otel_spans),
             "otel_bridge_log_file": str(otel_log),
         }
+    config_overrides = {}
+    if args.submit_novalidate is not None:
+        config_overrides["submit_novalidate"] = args.submit_novalidate
     generated_config, trace_path, output_dir = prepare_config(
         source_config,
         run_root,
+        config_overrides=config_overrides,
         otel=otel_cfg,
     )
 
@@ -673,20 +851,27 @@ def main() -> int:
     stampfile_source = None
     if not args.no_faketime:
         stamp_path, stampfile_source = resolve_stampfile_path(args.stampfile, run_root)
-        warn_on_implicit_stampfile(stamp_path, stampfile_source)
+        if args.faketime_mode == "legacy":
+            warn_on_implicit_stampfile(stamp_path, stampfile_source)
     stampfile = None if stamp_path is None else str(stamp_path)
     status.update(
         config_file=str(generated_config),
         trace_file=str(trace_path),
-        faketime_timestamp_file=stampfile,
+        faketime_timestamp_file=(
+            stampfile if not args.no_faketime and args.faketime_mode == "legacy" else None
+        ),
+        faketime_mode=None if args.no_faketime else args.faketime_mode,
     )
 
-    env = os.environ.copy()
+    env = drop_faketime_env(os.environ.copy())
     configure_flux_env(env)
     env.setdefault(
         "FLUX_FICTION_PATH_MAP",
         f"/home/j/Desktop/flux/sc25_poster={workspace_root()}",
     )
+    dftracer_env = configure_dftracer_env(env, run_root)
+    if dftracer_env:
+        status.update(dftracer_log_prefix=dftracer_env["DFTRACER_LOG_FILE"])
 
     faketime_env: dict[str, str] = {}
     first_submit = None
@@ -697,32 +882,35 @@ def main() -> int:
 
         first_submit = first_submit_epoch(trace_path)
         initial_fake_time = first_submit - max(0.0, float(args.faketime_start_lead))
-        if not args.dry_run:
+        if not args.dry_run and args.faketime_mode == "legacy":
             assert stamp_path is not None
             stamp_path.parent.mkdir(parents=True, exist_ok=True)
             stamp_path.write_text(f"{initial_fake_time - time.time():+.9f}s\n")
 
-        faketime_env = {
-            "FLUX_LOAD_WITH_DEEPBIND": "0",
-            "LD_PRELOAD": str(faketime_lib),
-            "FAKETIME_TIMESTAMP_FILE": str(stamp_path),
-            "FAKETIME_NO_CACHE": "1",
-        }
+        assert stamp_path is not None
+        faketime_env = build_faketime_environment(
+            faketime_lib,
+            stamp_path,
+            initial_fake_time,
+            args.faketime_mode,
+        )
         env.update(faketime_env)
 
     inner_script = build_inner_script(ff_root, generated_config, stampfile)
     inner_script_path = run_root / "run_inner.sh"
     write_inner_script(inner_script_path, inner_script)
     flux_exe = shutil.which("flux", path=env.get("PATH")) or "flux"
-    cmd = [
-        flux_exe,
-        "start",
-        f"--setattr=log-filename={broker_log}",
-        f"--setattr=log-level={args.broker_log_level}",
-        "--",
-        "bash",
-        str(inner_script_path),
-    ]
+    cmd = [flux_exe, "start"]
+    if not args.no_broker_log_file:
+        cmd.append(f"--setattr=log-filename={broker_log}")
+    cmd.extend(
+        [
+            f"--setattr=log-level={args.broker_log_level}",
+            "--",
+            "bash",
+            str(inner_script_path),
+        ]
+    )
 
     bridge_cmd = None
     bridge_extra_lines: list[str] = []
@@ -740,6 +928,11 @@ def main() -> int:
             "unset LD_PRELOAD",
             "unset FAKETIME_TIMESTAMP_FILE",
             "unset FAKETIME_NO_CACHE",
+            "unset FAKETIME_DONT_FAKE_MONOTONIC",
+            "unset FAKETIME_SHARED_CLOCK",
+            "unset FAKETIME_SHARED_CLOCK_INITIAL_NS",
+            "unset FAKETIME_SHARED_CLOCK_SHM",
+            "unset FAKETIME_SHARED",
             " ".join(shell_quote(part) for part in bridge_cmd) + " &",
             "bridge_pid=$!",
             "trap 'kill ${bridge_pid} 2>/dev/null || true; wait ${bridge_pid} 2>/dev/null || true' EXIT",
@@ -750,6 +943,7 @@ def main() -> int:
         cmd,
         {
             "FLUX_FICTION_PATH_MAP": env["FLUX_FICTION_PATH_MAP"],
+            **dftracer_env,
             **faketime_env,
         },
         extra_lines=bridge_extra_lines,
@@ -758,10 +952,18 @@ def main() -> int:
     print(f"Source config:    {source_config}")
     print(f"Generated config: {generated_config}")
     print(f"Output dir:       {output_dir}")
-    print(f"Broker log:       {broker_log}")
+    if args.no_broker_log_file:
+        print("Broker log:       disabled (errors remain in run.log)")
+    else:
+        print(f"Broker log:       {broker_log}")
     print(f"Run log:          {stdout_log}")
+    if dftracer_env:
+        print(f"DFTracer prefix:  {dftracer_env['DFTRACER_LOG_FILE']}")
     if not args.no_faketime:
-        print(f"Stamp file:       {stampfile}")
+        if args.faketime_mode == "legacy":
+            print(f"Stamp file:       {stampfile}")
+        else:
+            print("Faketime mode:    shared memory")
         print(f"First submit:     {first_submit:.6f}")
         print(f"Faketime lead:    {max(0.0, float(args.faketime_start_lead)):.6f}s")
     if args.otel:
@@ -781,6 +983,7 @@ def main() -> int:
         return 0
 
     bridge_proc = None
+    harness_telemetry = None
     proc = None
     broker_watch = None
     detected_fatal_error: dict[str, str] = {}
@@ -827,37 +1030,69 @@ def main() -> int:
                 raise RuntimeError(
                     "Timed out waiting for OpenTelemetry bridge socket at {}".format(otel_socket)
                 )
+            harness_telemetry = TelemetryClient(
+                str(otel_socket),
+                args.otel_service_name,
+                "python-harness",
+            )
 
         with stdout_log.open("w") as f:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=ff_root,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-            broker_watch = threading.Thread(
-                target=_watch_broker_log_for_fatal_error,
-                args=(broker_log, proc, detected_fatal_error, run_root),
-                daemon=True,
-            )
-            broker_watch.start()
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                if interrupted_reason is not None:
-                    break
-                f.write(line)
-                f.flush()
-                sys.stdout.write(line)
-            proc.wait()
+            with (
+                harness_telemetry.span("harness.flux_runtime", config_file=str(generated_config))
+                if harness_telemetry is not None
+                else nullcontext()
+            ):
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=ff_root,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    start_new_session=True,
+                )
+                if not args.no_broker_log_file:
+                    broker_watch = threading.Thread(
+                        target=_watch_broker_log_for_fatal_error,
+                        args=(broker_log, proc, detected_fatal_error, run_root),
+                        daemon=True,
+                    )
+                    broker_watch.start()
+                budget = _walltime_budget_seconds(
+                    getattr(args, "walltime_budget_seconds", None)
+                )
+                if budget:
+                    reserve = float(
+                        getattr(args, "finalize_reserve_seconds", None)
+                        or os.environ.get("FLUX_FICTION_FINALIZE_RESERVE_SECONDS", 0)
+                        or DEFAULT_FINALIZE_RESERVE_SECONDS
+                    )
+                    print(
+                        f"Walltime budget: {budget:.0f}s "
+                        f"(reserving {reserve:.0f}s to write partial results)",
+                        flush=True,
+                    )
+                    threading.Thread(
+                        target=_watch_walltime_budget,
+                        args=(proc, run_root / "output", budget, reserve),
+                        daemon=True,
+                    ).start()
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if interrupted_reason is not None:
+                        break
+                    f.write(line)
+                    f.flush()
+                    sys.stdout.write(line)
+                proc.wait()
     finally:
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
         if broker_watch is not None:
             broker_watch.join(timeout=1)
+        if harness_telemetry is not None:
+            harness_telemetry.close()
         if bridge_proc is not None:
             bridge_proc.terminate()
             try:
